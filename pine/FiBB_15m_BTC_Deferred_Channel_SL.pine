@@ -1,0 +1,165 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © FiBB — 對齊 Python「延遲通道止損 + 固定 % 止盈」版（fibb_trading/core/fibb_logic.py）
+//
+// === TradingView 要如何設成與 Python 一樣（必讀）===
+//
+// 1) 持倉模式（最重要）
+//    Python 是「六個 leg 各自獨立」：可同時有多單與空單（對應 Binance 雙向持倉）。
+//    TradingView 若用「單向／淨持倉」，開 T1 空時會先平掉 B1 多，成交清單會長得跟 Python 完全不同。
+//    請在策略回測／圖表相關設定中，改為可同持多空（介面常見名稱：Hedge、雙向、Long & Short 分開等；
+//    實際位置依 TV 版本在「策略屬性」「圖表設定」或商品為永續時的持倉選項）。
+//
+// 2) 商品與週期
+//    與 Python 一致：Binance **USD-M 永續** BTCUSDT、**15 分鐘**。
+//    圖表時區建議用 **UTC** 或與你比對 Python 時使用的時區一致，避免「同一根 K」對錯時間。
+//
+// 3) 佣金與資金
+//    Python 預設 fee_rate=0；TV 請將策略佣金設為 0%（本腳本 commission_value = 0）。
+//    Python 可選 initial_capital + leverage 縮單；TV 固定口數時若資金不足會由 TV 自動減量，與 Python 仍可能略有差異。
+//
+// 4) 本腳本邏輯（與 run_fibb_backtest 相同順序）
+//    每根：先依 high/low 檢查平倉 → 再進場 → 再為 T2/B2 啟用延遲通道止損。
+//    止盈：進場價 ± Take Profit %（固定，不隨通道漂移；對應 Python use_channel_tp=false）。
+//    若你要對齊 Python「通道止盈」，請用回測 CLI 的 --channel-tp；本 Pine 目前未實作該模式。
+//
+//@version=5
+strategy(
+     "FiBB 15m BTC Layer (Deferred Channel SL)",
+     shorttitle = "FiBB DefSL",
+     overlay = true,
+     pyramiding = 6,
+     initial_capital = 100000,
+     default_qty_type = strategy.fixed,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     commission_type = strategy.commission.percent,
+     commission_value = 0)
+
+// === Inputs ===
+len         = input.int(20, "Length", minval = 1)
+tpPct       = input.float(0.5, "Take Profit %", step = 0.1) / 100.0
+fibratio1   = input.float(1.618, "Fibonacci Ratio 1")
+fibratio2   = input.float(2.618, "Fibonacci Ratio 2")
+fibratio3   = input.float(4.236, "Fibonacci Ratio 3")
+
+startTime   = input.time(timestamp("2026-02-24 00:00 +0000"), "Backtest Start (UTC)")
+endTime     = input.time(timestamp("2026-05-26 23:59 +0000"), "Backtest End (UTC)")
+inDateRange = time >= startTime and time <= endTime
+
+qtyT1 = input.float(1.0, "T1 / B1 qty (BTC)", minval = 0.0001, step = 0.1)
+qtyT2 = input.float(2.0, "T2 / B2 qty (BTC)", minval = 0.0001, step = 0.1)
+qtyT3 = input.float(3.0, "T3 / B3 qty (BTC)", minval = 0.0001, step = 0.1)
+
+showBands = input.bool(true, "Plot FiBB bands")
+
+// === Channels (Wilder ATR = ta.atr) ===
+basis = ta.sma(close, len)
+avg   = ta.atr(len)
+top1  = basis + fibratio1 * avg
+top2  = basis + fibratio2 * avg
+top3  = basis + fibratio3 * avg
+bott1 = basis - fibratio1 * avg
+bott2 = basis - fibratio2 * avg
+bott3 = basis - fibratio3 * avg
+
+// 由內向外穿越（與 Python _touch_short / _touch_long 一致）
+touchShort(float level) =>
+    high >= level and high[1] < level[1]
+
+touchLong(float level) =>
+    low <= level and low[1] > level[1]
+
+// === 依 entry_id 查持倉 ===
+openQty(string entryId) =>
+    float q = 0.0
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(i) == entryId
+                q += strategy.opentrades.size(i)
+    q
+
+openEntryPrice(string entryId) =>
+    float p = na
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(i) == entryId
+                p := strategy.opentrades.entry_price(i)
+                break
+    p
+
+// T2/B2 延遲通道止損狀態（觸 T3/B3 當根鎖定 top2/bott2）
+var float t2ChannelSl = na
+var bool  t2SlArmed   = false
+var float b2ChannelSl = na
+var bool  b2SlArmed   = false
+
+if openQty("T2 Short") == 0
+    t2SlArmed   := false
+    t2ChannelSl := na
+
+if openQty("B2 Long") == 0
+    b2SlArmed   := false
+    b2ChannelSl := na
+
+// === 平倉（每根 K 用 high/low；同根 TP+通道止損時通道優先）===
+manageShortExit(string entryId, bool useChannelSl, float channelSl, bool channelArmed) =>
+    if openQty(entryId) > 0
+        float ep     = openEntryPrice(entryId)
+        float tpPx   = ep * (1.0 - tpPct)
+        bool  tpHit  = low <= tpPx
+        bool  chHit  = useChannelSl and channelArmed and low <= channelSl
+        if chHit or tpHit
+            string tag = chHit and tpHit ? "ChStop" : chHit ? "ChStop" : "TP"
+            strategy.close(entryId, comment = tag)
+
+manageLongExit(string entryId, bool useChannelSl, float channelSl, bool channelArmed) =>
+    if openQty(entryId) > 0
+        float ep     = openEntryPrice(entryId)
+        float tpPx   = ep * (1.0 + tpPct)
+        bool  tpHit  = high >= tpPx
+        bool  chHit  = useChannelSl and channelArmed and high >= channelSl
+        if chHit or tpHit
+            string tag = chHit and tpHit ? "ChStop" : chHit ? "ChStop" : "TP"
+            strategy.close(entryId, comment = tag)
+
+manageShortExit("T1 Short", false, na, false)
+manageShortExit("T2 Short", true, t2ChannelSl, t2SlArmed)
+manageShortExit("T3 Short", false, na, false)
+manageLongExit("B1 Long", false, na, false)
+manageLongExit("B2 Long", true, b2ChannelSl, b2SlArmed)
+manageLongExit("B3 Long", false, na, false)
+
+// === 進場（僅回測區間內、收盤、最多 6 leg）===
+canEnter = strategy.opentrades < 6
+
+if inDateRange and canEnter
+    if touchShort(top1) and openQty("T1 Short") == 0
+        strategy.entry("T1 Short", strategy.short, qty = qtyT1)
+    if touchShort(top2) and openQty("T2 Short") == 0
+        strategy.entry("T2 Short", strategy.short, qty = qtyT2)
+    if touchShort(top3) and openQty("T3 Short") == 0
+        strategy.entry("T3 Short", strategy.short, qty = qtyT3)
+    if touchLong(bott1) and openQty("B1 Long") == 0
+        strategy.entry("B1 Long", strategy.long, qty = qtyT1)
+    if touchLong(bott2) and openQty("B2 Long") == 0
+        strategy.entry("B2 Long", strategy.long, qty = qtyT2)
+    if touchLong(bott3) and openQty("B3 Long") == 0
+        strategy.entry("B3 Long", strategy.long, qty = qtyT3)
+
+// 進場之後才啟用延遲止損（與 Python arm_deferred_channel_stops 順序一致）
+if openQty("T2 Short") > 0 and not t2SlArmed and touchShort(top3)
+    t2ChannelSl := top2
+    t2SlArmed   := true
+
+if openQty("B2 Long") > 0 and not b2SlArmed and touchLong(bott3)
+    b2ChannelSl := bott2
+    b2SlArmed   := true
+
+// === 圖表 ===
+plot(showBands ? basis : na, "Basis", color = color.gray)
+plot(showBands ? top1  : na, "Top1",  color = color.red)
+plot(showBands ? top2  : na, "Top2",  color = color.orange)
+plot(showBands ? top3  : na, "Top3",  color = color.maroon)
+plot(showBands ? bott1 : na, "Bott1", color = color.green)
+plot(showBands ? bott2 : na, "Bott2", color = color.teal)
+plot(showBands ? bott3 : na, "Bott3", color = color.lime)
