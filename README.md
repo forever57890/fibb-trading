@@ -167,6 +167,9 @@ FIBB_CHANNEL_TP=0
 FIBB_FEE_RATE=0
 FIBB_INITIAL_CAPITAL=100000
 FIBB_LEVERAGE=2
+
+# 開倉後先掛固定 % TP；之後每 15m 依 basis（中線）重掛 TP（1=開，0=關）
+FIBB_REPRICE_TP_TO_BASIS=1
 ```
 
 ### 2) 單次執行（手動）
@@ -203,8 +206,12 @@ TZ=UTC
 ### 4) 實盤檔案位置
 
 - 狀態檔：`trade/runtime/fibb_15m_state.json`
-- 每次執行記錄：`trade/runtime/fibb_15m_runs.log`
-- cron 輸出：`trade/runtime/fibb_cron.log`
+- 每次執行記錄：`trade/runtime/fibb_15m_runs.log`（人類可讀總結 + JSON）
+- cron 輸出：`trade/runtime/fibb_cron.log`（與終端機相同之總結區塊）
+
+每次執行會輸出 **本根總結**（例如「本根無觸軌進場」「T1 Short 已有持倉」）及 **Leg 進場診斷**（六個 leg 是否觸軌、high/low 與通道價對照）。有持倉時會列出 **HOLD** 與止盈/止損價是否觸及。
+
+環境變數：`FIBB_LOG_JSON=0` 可關閉 runs.log 內的 JSON 區塊；`FIBB_PRINT_JSON=1` 可在終端額外印完整 JSON。`FIBB_REPRICE_TP_TO_BASIS=0` 時持倉 TP 維持開倉時的固定 %，不每根 K 重掛至中線。
 
 ### 5) 重要風險與檢查
 

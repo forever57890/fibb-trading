@@ -57,6 +57,153 @@ def market_open_leg(
     )
 
 
+def open_leg_with_tp(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    side: str,
+    qty: float,
+    take_profit_price: float,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Open a leg with qty, then place a TAKE_PROFIT_MARKET algo order for the filled qty.
+    Returns the open result plus tp_algo_id (None on dry run or if TP placement fails).
+    """
+    position_side = position_side_for_leg(side)
+    qty = trader.round_qty(symbol, qty)
+    tp_price = trader.round_price(symbol, take_profit_price)
+    close_side = "SELL" if position_side == "LONG" else "BUY"
+
+    if dry_run:
+        return {
+            "status": "DRY_RUN_OPEN",
+            "symbol": symbol,
+            "position_side": position_side,
+            "qty": qty,
+            "take_profit_price": tp_price,
+            "tp_algo_id": None,
+        }
+
+    current = abs(trader.get_position_amount(symbol, position_side))
+    target = trader.round_qty(symbol, current + qty)
+    open_result = trader.adjust_position_with_ioc_then_market(
+        symbol,
+        position_side,
+        target_qty=target,
+        mode="open",
+        dry_run=False,
+    )
+
+    filled_qty = abs(trader.get_position_amount(symbol, position_side))
+    filled_qty = trader.round_qty(symbol, filled_qty)
+
+    tp_algo_id = None
+    tp_order = None
+    if filled_qty >= (trader._min_trade_qty(symbol) or 0):
+        try:
+            tp_order = trader.create_algo_conditional_order(
+                symbol=symbol,
+                side=close_side,
+                position_side=position_side,
+                order_type="TAKE_PROFIT_MARKET",
+                quantity=filled_qty,
+                trigger_price=tp_price,
+            )
+            tp_algo_id = tp_order.get("algoId") or tp_order.get("clientAlgoId")
+        except Exception as exc:
+            tp_order = {"error": str(exc)}
+
+    return {
+        **open_result,
+        "take_profit_price": tp_price,
+        "tp_order": tp_order,
+        "tp_algo_id": tp_algo_id,
+    }
+
+
+def cancel_leg_tp(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    tp_algo_id: Any,
+) -> Dict[str, Any]:
+    """Cancel a single TP algo order by algoId before closing the leg."""
+    if tp_algo_id is None:
+        return {"status": "NO_TP_ALGO_ID"}
+    try:
+        result = trader._request(  # noqa: SLF001
+            "DELETE",
+            "/fapi/v1/algoOrder",
+            params={"symbol": symbol, "algoId": tp_algo_id},
+            signed=True,
+        )
+        return {"status": "CANCELLED", "result": result}
+    except BinanceFuturesAPIError as exc:
+        return {"status": "CANCEL_ERROR", "error": str(exc.payload)}
+
+
+def replace_leg_tp(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    side: str,
+    qty: float,
+    take_profit_price: float,
+    old_tp_algo_id: Any = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Replace TP algo order for one leg: cancel old TP (if any), then create new TP.
+    """
+    position_side = position_side_for_leg(side)
+    close_side = "SELL" if position_side == "LONG" else "BUY"
+    rounded_qty = trader.round_qty(symbol, qty)
+    tp_price = trader.round_price(symbol, take_profit_price)
+
+    if dry_run:
+        return {
+            "status": "DRY_RUN_REPRICE_TP",
+            "position_side": position_side,
+            "qty": rounded_qty,
+            "take_profit_price": tp_price,
+            "old_tp_algo_id": old_tp_algo_id,
+            "tp_algo_id": old_tp_algo_id,
+        }
+
+    cancel_result = cancel_leg_tp(trader, symbol, old_tp_algo_id)
+    if rounded_qty <= 0:
+        return {
+            "status": "NO_QTY",
+            "cancel": cancel_result,
+            "take_profit_price": tp_price,
+            "tp_algo_id": None,
+        }
+
+    try:
+        tp_order = trader.create_algo_conditional_order(
+            symbol=symbol,
+            side=close_side,
+            position_side=position_side,
+            order_type="TAKE_PROFIT_MARKET",
+            quantity=rounded_qty,
+            trigger_price=tp_price,
+        )
+        tp_algo_id = tp_order.get("algoId") or tp_order.get("clientAlgoId")
+        return {
+            "status": "REPLACED",
+            "cancel": cancel_result,
+            "tp_order": tp_order,
+            "take_profit_price": tp_price,
+            "tp_algo_id": tp_algo_id,
+        }
+    except Exception as exc:
+        return {
+            "status": "REPLACE_ERROR",
+            "cancel": cancel_result,
+            "error": str(exc),
+            "take_profit_price": tp_price,
+            "tp_algo_id": old_tp_algo_id,
+        }
+
+
 def market_close_leg_qty(
     trader: BinanceFuturesTrader,
     symbol: str,
@@ -124,9 +271,12 @@ def ensure_dual_side_position_mode(trader: BinanceFuturesTrader) -> Dict[str, An
 __all__ = [
     "BinanceFuturesAPIError",
     "BinanceFuturesTrader",
+    "cancel_leg_tp",
     "ensure_dual_side_position_mode",
     "market_close_leg_qty",
     "market_open_leg",
+    "open_leg_with_tp",
+    "replace_leg_tp",
     "require_binance_keys",
     "try_create_trader",
 ]

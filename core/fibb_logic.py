@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from fibb_trading.core.fibb_config import (
+    ALL_LEGS,
     CHANNEL_TP_TARGET,
     DEFERRED_CHANNEL_SL,
     DEFAULT_PARAMS,
@@ -107,6 +108,127 @@ def _touch_long(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
     if pd.isna(level) or pd.isna(prev_level):
         return False
     return float(curr["low"]) <= float(level) and float(prev["low"]) > float(prev_level)
+
+
+def analyze_entry_legs(
+    curr: pd.Series,
+    prev: pd.Series,
+    open_entry_ids: set,
+) -> List[dict]:
+    """
+    每個 leg 在本根 K 的進場狀態（供實盤 log 解釋為何未開單）。
+    status: channels_not_ready | already_open | touch_signal | no_touch
+    """
+    rows: List[dict] = []
+    for entry_id, side, qty, band in ALL_LEGS:
+        level = curr.get(band)
+        prev_level = prev.get(band)
+        row: dict = {
+            "entry_id": entry_id,
+            "side": side,
+            "band": band,
+            "qty_btc": qty,
+        }
+        if pd.isna(level) or pd.isna(prev_level):
+            row["status"] = "channels_not_ready"
+            row["reason"] = f"通道 {band} 尚未就緒（暖機中）"
+            rows.append(row)
+            continue
+
+        level_f = float(level)
+        prev_level_f = float(prev_level)
+        if side == "SHORT":
+            high = float(curr["high"])
+            prev_high = float(prev["high"])
+            crossed = high >= level_f and prev_high < prev_level_f
+            row["touch"] = {
+                "rule": "high >= band 且 high[1] < band[1]",
+                "high": high,
+                "prev_high": prev_high,
+                "band": level_f,
+                "prev_band": prev_level_f,
+                "crossed": crossed,
+            }
+        else:
+            low = float(curr["low"])
+            prev_low = float(prev["low"])
+            crossed = low <= level_f and prev_low > prev_level_f
+            row["touch"] = {
+                "rule": "low <= band 且 low[1] > band[1]",
+                "low": low,
+                "prev_low": prev_low,
+                "band": level_f,
+                "prev_band": prev_level_f,
+                "crossed": crossed,
+            }
+
+        if entry_id in open_entry_ids:
+            row["status"] = "already_open"
+            row["reason"] = "該 leg 已有持倉，不重複進場"
+        elif crossed:
+            row["status"] = "touch_signal"
+            row["reason"] = "觸軌進場訊號"
+        else:
+            row["status"] = "no_touch"
+            if side == "SHORT":
+                if high < level_f:
+                    row["reason"] = "未觸軌：最高價低於上軌"
+                elif prev_high >= prev_level_f:
+                    row["reason"] = "未觸軌：前一根已在上軌之上（非首次穿越）"
+                else:
+                    row["reason"] = "未觸軌"
+            else:
+                if low > level_f:
+                    row["reason"] = "未觸軌：最低價高於下軌"
+                elif prev_low <= prev_level_f:
+                    row["reason"] = "未觸軌：前一根已在下軌之下（非首次穿越）"
+                else:
+                    row["reason"] = "未觸軌"
+        rows.append(row)
+    return rows
+
+
+def analyze_open_leg_exits(
+    leg: OpenLeg, bar_high: float, bar_low: float
+) -> dict:
+    """持倉 leg 在本根 K 是否應平倉（供 log）。"""
+    exit_price, reason = try_exit_leg(leg, bar_high, bar_low)
+    out: dict = {
+        "entry_id": leg.entry_id,
+        "side": leg.side,
+        "qty": leg.qty,
+        "entry_price": leg.entry_price,
+        "take_profit": leg.take_profit_price,
+        "stop_loss": leg.stop_loss_price,
+        "sl_use_channel": leg.sl_use_channel,
+        "bar_high": bar_high,
+        "bar_low": bar_low,
+        "would_exit": exit_price is not None,
+        "exit_reason": reason,
+        "exit_price": exit_price,
+    }
+    if leg.side == "LONG":
+        out["tp_hit"] = bar_high >= leg.take_profit_price
+        if leg.stop_loss_price is None:
+            out["sl_hit"] = False
+        elif leg.sl_use_channel:
+            out["sl_hit"] = bar_high >= leg.stop_loss_price
+        else:
+            out["sl_hit"] = bar_low <= leg.stop_loss_price
+    else:
+        out["tp_hit"] = bar_low <= leg.take_profit_price
+        if leg.stop_loss_price is None:
+            out["sl_hit"] = False
+        elif leg.sl_use_channel:
+            out["sl_hit"] = bar_low <= leg.stop_loss_price
+        else:
+            out["sl_hit"] = bar_high >= leg.stop_loss_price
+    if not out["would_exit"]:
+        if leg.stop_loss_price is None:
+            out["hold_reason"] = "未觸及止盈；此 leg 尚無止損"
+        else:
+            out["hold_reason"] = "未觸及止盈或止損"
+    return out
 
 
 def detect_entry_signals(

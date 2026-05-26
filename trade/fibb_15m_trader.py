@@ -30,6 +30,11 @@ from fibb_trading.trade.exchange import (
 )
 from fibb_trading.trade.fibb_live_engine import latest_closed_bar_index, process_bar
 from fibb_trading.trade.live_state import LiveState
+from fibb_trading.trade.run_logging import (
+    enrich_run_record,
+    format_run_log_block,
+    print_run_output,
+)
 from fibb_trading.trade.runtime_io import (
     ensure_runtime_dir,
     safe_append_log,
@@ -50,6 +55,8 @@ DRY_RUN = os.getenv("FIBB_DRY_RUN", "1") == "1"
 WARMUP_BARS = int(os.getenv("FIBB_WARMUP_BARS", "50"))
 IGNORE_STATE = os.getenv("FIBB_IGNORE_STATE", "0") == "1"
 FORCE_BAR_TIME = os.getenv("FIBB_FORCE_BAR_TIME")  # ISO open_time for replay
+# 1 = 每根 K 將持倉 TP 重掛至 basis（中線）；0 = 維持開倉時的固定 % TP
+REPRICE_TP_TO_BASIS = os.getenv("FIBB_REPRICE_TP_TO_BASIS", "1") == "1"
 
 
 def utc_now_iso() -> str:
@@ -76,6 +83,7 @@ def build_config_snapshot() -> Dict[str, Any]:
         "interval": INTERVAL,
         "dry_run": DRY_RUN,
         "warmup_bars": WARMUP_BARS,
+        "reprice_tp_to_basis": REPRICE_TP_TO_BASIS,
         "params": {
             "length": p.length,
             "tp_pct": p.tp_pct,
@@ -98,10 +106,8 @@ def save_state(state: LiveState) -> None:
 
 
 def append_log(record: dict) -> None:
-    safe_append_log(
-        LOG_FILE,
-        json.dumps(record, ensure_ascii=False, indent=2) + "\n---\n",
-    )
+    """Expect *record* already passed through enrich_run_record."""
+    safe_append_log(LOG_FILE, format_run_log_block(record))
 
 
 def fetch_klines() -> pd.DataFrame:
@@ -136,6 +142,7 @@ def run_once() -> Dict[str, Any]:
     if not DRY_RUN and trader is None:
         record["action"] = "ERROR"
         record["error"] = "Missing bn_api_key / bn_api_secret"
+        record = enrich_run_record(record)
         append_log(record)
         return record
 
@@ -169,6 +176,7 @@ def run_once() -> Dict[str, Any]:
         symbol=SYMBOL,
         dry_run=DRY_RUN,
         wallet_equity=equity,
+        reprice_tp_to_basis=REPRICE_TP_TO_BASIS,
     )
     record["bar"] = bar_log
     record["bar_index"] = bar_index
@@ -188,6 +196,7 @@ def run_once() -> Dict[str, Any]:
         except Exception as exc:
             record["account_after_error"] = str(exc)
 
+    record = enrich_run_record(record)
     append_log(record)
     return record
 
@@ -195,20 +204,22 @@ def run_once() -> Dict[str, Any]:
 def main() -> int:
     try:
         record = run_once()
-        print(json.dumps(record, ensure_ascii=False, indent=2))
+        print_run_output(record)
         if record.get("action") == "ERROR":
             return 1
         return 0
     except Exception as exc:
-        err = {
-            "run_at": utc_now_iso(),
-            "action": "ERROR",
-            "error": str(exc),
-            "traceback": traceback.format_exc(),
-            "config": build_config_snapshot(),
-        }
+        err = enrich_run_record(
+            {
+                "run_at": utc_now_iso(),
+                "action": "ERROR",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "config": build_config_snapshot(),
+            }
+        )
         append_log(err)
-        print(json.dumps(err, ensure_ascii=False, indent=2), file=sys.stderr)
+        print_run_output(err)
         return 1
 
 

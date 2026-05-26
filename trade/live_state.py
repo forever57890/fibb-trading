@@ -40,9 +40,10 @@ class LiveState:
         )
 
 
-def leg_to_dict(leg: OpenLeg) -> dict:
+def leg_to_dict(leg: OpenLeg, *, tp_algo_id: Any = None) -> dict:
     d = asdict(leg)
     d["entry_time"] = pd.Timestamp(leg.entry_time).isoformat()
+    d["tp_algo_id"] = tp_algo_id
     return d
 
 
@@ -61,12 +62,31 @@ def leg_from_dict(d: dict) -> OpenLeg:
     )
 
 
+def get_tp_algo_id(state: "LiveState", entry_id: str) -> Any:
+    """Return the stored TP algo order ID for a leg (None if not set)."""
+    return (state.open_legs.get(entry_id) or {}).get("tp_algo_id")
+
+
 def open_legs_objects(state: LiveState) -> Dict[str, OpenLeg]:
     return {k: leg_from_dict(v) for k, v in state.open_legs.items()}
 
 
-def save_open_legs(state: LiveState, legs: Dict[str, OpenLeg]) -> None:
-    state.open_legs = {k: leg_to_dict(v) for k, v in legs.items()}
+def save_open_legs(
+    state: LiveState,
+    legs: Dict[str, OpenLeg],
+    *,
+    tp_algo_ids: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist legs; tp_algo_ids maps entry_id -> algoId (merged with existing if not provided)."""
+    saved: Dict[str, dict] = {}
+    for k, leg in legs.items():
+        existing = state.open_legs.get(k) or {}
+        if tp_algo_ids is not None:
+            algo_id = tp_algo_ids.get(k)
+        else:
+            algo_id = existing.get("tp_algo_id")
+        saved[k] = leg_to_dict(leg, tp_algo_id=algo_id)
+    state.open_legs = saved
 
 
 def append_closed_trade(state: LiveState, record: dict) -> None:
