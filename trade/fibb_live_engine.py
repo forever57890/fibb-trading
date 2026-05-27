@@ -9,7 +9,13 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from fibb_trading.core.fibb_config import FibbParams
+from fibb_trading.core.fibb_config import (
+    FibbParams,
+    tp_mode_channel_tracks_bar,
+    tp_mode_uses_channel,
+    tp_mode_label,
+)
+from fibb_trading.core.fibb_env import first_tradable_bar_index, indicator_history_bars
 from fibb_trading.core.fibb_logic import (
     OpenLeg,
     analyze_entry_legs,
@@ -18,8 +24,10 @@ from fibb_trading.core.fibb_logic import (
     bracket_prices,
     detect_entry_signals,
     refresh_channel_take_profits,
+    refresh_reprice_tp_to_basis,
     resolve_entry_qty,
-    resolve_take_profit,
+    resolve_entry_take_profit,
+    take_profit_price_pct,
     try_exit_leg,
     uses_deferred_channel_sl,
 )
@@ -38,6 +46,54 @@ from fibb_trading.trade.live_state import (
     open_legs_objects,
     save_open_legs,
 )
+
+
+def _sync_exchange_take_profits(
+    *,
+    open_legs: Dict[str, OpenLeg],
+    state: LiveState,
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    dry_run: bool,
+    log: Dict[str, Any],
+    tp_algo_ids_updates: Dict[str, Any],
+    reprice_kind: str,
+    old_tp_by_id: Optional[Dict[str, float]] = None,
+) -> None:
+    """Cancel/replace TP algo orders to match leg.take_profit_price (basis or channel)."""
+    for entry_id, leg in open_legs.items():
+        new_tp = leg.take_profit_price
+        old_tp_algo_id = get_tp_algo_id(state, entry_id)
+        reprice_log: Dict[str, Any] = {
+            "entry_id": entry_id,
+            "kind": reprice_kind,
+            "old_tp": (old_tp_by_id or {}).get(entry_id, new_tp),
+            "new_tp": new_tp,
+            "old_tp_algo_id": old_tp_algo_id,
+            "take_profit_band": leg.take_profit_band,
+        }
+        if trader is not None:
+            replace_result = replace_leg_tp(
+                trader,
+                symbol,
+                leg.side,
+                leg.qty,
+                new_tp,
+                old_tp_algo_id=old_tp_algo_id,
+                dry_run=dry_run,
+            )
+            reprice_log["exchange"] = replace_result
+            new_tp_algo_id = replace_result.get("tp_algo_id")
+            if new_tp_algo_id is not None:
+                tp_algo_ids_updates[entry_id] = new_tp_algo_id
+            elif old_tp_algo_id is not None:
+                tp_algo_ids_updates[entry_id] = old_tp_algo_id
+        elif dry_run:
+            reprice_log["exchange"] = {
+                "status": "DRY_RUN_REPRICE_TP",
+                "take_profit_price": new_tp,
+            }
+        log["tp_reprices"].append(reprice_log)
 
 
 def _closed_stub(leg: OpenLeg, ts: pd.Timestamp, exit_price: float, reason: str, fee_rate: float) -> dict:
@@ -71,16 +127,38 @@ def process_bar(
     symbol: str = "BTCUSDT",
     dry_run: bool = False,
     wallet_equity: Optional[float] = None,
-    reprice_tp_to_basis: bool = True,
 ) -> Dict[str, Any]:
     """
     Process a single closed 15m bar. Mutates *state* and returns action log.
     """
     if bar_index < 1:
-        return {"skipped": True, "reason": "warmup"}
+        return {
+            "skipped": True,
+            "reason": "insufficient_history",
+            "bar_index": bar_index,
+            "klines_count": len(df),
+            "need_at_least": 2,
+        }
 
     curr = df.iloc[bar_index]
     prev = df.iloc[bar_index - 1]
+
+    channel_cols = ("basis", "top1", "bott1")
+    missing = [
+        c
+        for c in channel_cols
+        if c not in df.columns or pd.isna(curr.get(c)) or pd.isna(prev.get(c))
+    ]
+    if missing or bar_index < first_tradable_bar_index(params.length):
+        return {
+            "skipped": True,
+            "reason": "insufficient_history",
+            "bar_index": bar_index,
+            "klines_count": len(df),
+            "history_bars_requested": indicator_history_bars(params.length),
+            "need_bar_index_at_least": first_tradable_bar_index(params.length),
+            "missing_channels": missing,
+        }
     ts = curr["open_time"]
     ts_iso = pd.Timestamp(ts).isoformat()
 
@@ -103,7 +181,32 @@ def process_bar(
         "hold_diagnostics": [],
     }
 
-    refresh_channel_take_profits(open_legs, curr, params)
+    if trader is not None and not dry_run:
+        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+        for side in ("LONG", "SHORT"):
+            exchange_amt = abs(trader.get_position_amount(symbol, side))
+            virtual_amt = sum(
+                leg.qty for leg in open_legs.values() if leg.side == side
+            )
+            if exchange_amt > virtual_amt + min_qty * 2:
+                log.setdefault("position_mismatch", []).append(
+                    {
+                        "side": side,
+                        "exchange_amt": exchange_amt,
+                        "virtual_amt": virtual_amt,
+                        "excess": round(exchange_amt - virtual_amt, 8),
+                        "open_leg_ids": [
+                            leg.entry_id
+                            for leg in open_legs.values()
+                            if leg.side == side
+                        ],
+                    }
+                )
+
+    old_channel_tps: Dict[str, float] = {}
+    if tp_mode_channel_tracks_bar(params):
+        old_channel_tps = {eid: leg.take_profit_price for eid, leg in open_legs.items()}
+        refresh_channel_take_profits(open_legs, curr, params)
 
     # --- exits ---
     for entry_id in list(open_legs.keys()):
@@ -132,45 +235,38 @@ def process_bar(
         del open_legs[entry_id]
 
     tp_algo_ids_updates: Dict[str, Any] = {}
-    log["reprice_tp_to_basis"] = reprice_tp_to_basis
-    basis_value = curr.get("basis")
-    if reprice_tp_to_basis and not pd.isna(basis_value):
-        basis_tp = float(basis_value)
-        for entry_id, leg in open_legs.items():
-            old_tp = leg.take_profit_price
-            old_tp_algo_id = get_tp_algo_id(state, entry_id)
-            leg.take_profit_price = basis_tp
-            leg.take_profit_band = "basis"
-            reprice_log: Dict[str, Any] = {
-                "entry_id": entry_id,
-                "old_tp": old_tp,
-                "new_tp": basis_tp,
-                "old_tp_algo_id": old_tp_algo_id,
-            }
-            if trader is not None:
-                replace_result = replace_leg_tp(
-                    trader,
-                    symbol,
-                    leg.side,
-                    leg.qty,
-                    basis_tp,
-                    old_tp_algo_id=old_tp_algo_id,
-                    dry_run=dry_run,
-                )
-                reprice_log["exchange"] = replace_result
-                new_tp_algo_id = replace_result.get("tp_algo_id")
-                if new_tp_algo_id is not None:
-                    tp_algo_ids_updates[entry_id] = new_tp_algo_id
-                elif old_tp_algo_id is not None:
-                    tp_algo_ids_updates[entry_id] = old_tp_algo_id
-            elif dry_run:
-                reprice_log["exchange"] = {
-                    "status": "DRY_RUN_REPRICE_TP",
-                    "take_profit_price": basis_tp,
-                }
-            log["tp_reprices"].append(reprice_log)
-    elif not reprice_tp_to_basis and open_legs:
-        log["tp_reprice_note"] = "FIBB_REPRICE_TP_TO_BASIS=0，維持開倉時固定 % TP，不重掛中線"
+    log["tp_mode"] = params.tp_mode
+    log["tp_mode_label"] = tp_mode_label(params.tp_mode)
+    if params.tp_mode == 1:
+        old_tps = {eid: leg.take_profit_price for eid, leg in open_legs.items()}
+        refresh_reprice_tp_to_basis(open_legs, curr, params)
+        _sync_exchange_take_profits(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            tp_algo_ids_updates=tp_algo_ids_updates,
+            reprice_kind="basis",
+            old_tp_by_id=old_tps,
+        )
+    elif tp_mode_channel_tracks_bar(params) and open_legs:
+        _sync_exchange_take_profits(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            tp_algo_ids_updates=tp_algo_ids_updates,
+            reprice_kind="channel",
+            old_tp_by_id=old_channel_tps,
+        )
+    elif params.tp_mode == 3 and open_legs:
+        log["tp_reprice_note"] = "FIBB_TP_MODE=3，通道止盈開倉時鎖定，不重掛"
+    elif params.tp_mode == 0 and open_legs:
+        log["tp_reprice_note"] = "FIBB_TP_MODE=0，維持開倉時固定 % TP，不重掛"
 
     for entry_id, leg in open_legs.items():
         log["hold_diagnostics"].append(analyze_open_leg_exits(leg, bar_high, bar_low))
@@ -208,7 +304,10 @@ def process_bar(
                 )
                 continue
 
-            tp, tp_band = resolve_take_profit(entry_id, side, close_price, curr, params)
+            entry_tp, tp_band = resolve_entry_take_profit(
+                entry_id, side, close_price, curr, params
+            )
+            channel_tp_at_open = entry_tp if tp_mode_uses_channel(params) else None
             if uses_deferred_channel_sl(entry_id, params):
                 sl = None
                 sl_channel = False
@@ -220,23 +319,49 @@ def process_bar(
                 sl_channel = False
 
             exec_result: Dict[str, Any] = {"entry_id": entry_id, "qty": qty, "side": side}
+            fill_entry = close_price
+            tp = None
             if trader is not None:
                 open_result = open_leg_with_tp(
-                    trader, symbol, side, qty, tp, dry_run=dry_run
+                    trader,
+                    symbol,
+                    side,
+                    qty,
+                    params.tp_pct,
+                    signal_close=close_price,
+                    take_profit_price=channel_tp_at_open,
+                    dry_run=dry_run,
                 )
                 exec_result["exchange"] = open_result
                 exec_result["tp_algo_id"] = open_result.get("tp_algo_id")
+                fill_entry = float(open_result.get("fill_entry_price") or close_price)
+                tp = float(open_result.get("take_profit_price") or 0)
                 new_tp_algo_ids[entry_id] = open_result.get("tp_algo_id")
+                leg_qty = float(open_result.get("final_leg_filled_qty") or qty)
+                if leg_qty <= 0:
+                    leg_qty = qty
+                exec_result["leg_qty"] = leg_qty
+                if open_result.get("overfill_warning"):
+                    exec_result["overfill_warning"] = True
+                    exec_result["overfill_qty"] = open_result.get("overfill_qty")
+                qty = leg_qty
             elif dry_run:
+                fill_entry = close_price
+                tp = take_profit_price_pct(side, fill_entry, params)
                 exec_result["exchange"] = {"status": "DRY_RUN_OPEN"}
                 exec_result["tp_algo_id"] = None
+
+            if tp is None:
+                tp = entry_tp if tp_mode_uses_channel(params) else take_profit_price_pct(
+                    side, fill_entry, params
+                )
 
             open_legs[entry_id] = OpenLeg(
                 entry_id=entry_id,
                 side=side,
                 qty=qty,
                 entry_time=ts,
-                entry_price=close_price,
+                entry_price=fill_entry,
                 take_profit_price=tp,
                 stop_loss_price=sl,
                 band=band,

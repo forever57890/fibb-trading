@@ -11,6 +11,8 @@ from fibb_trading.core.fibb_logic import (
     compute_rma,
     compute_true_range,
     resolve_entry_qty,
+    refresh_channel_take_profits,
+    refresh_reprice_tp_to_basis,
     resolve_take_profit,
     run_fibb_backtest,
     take_profit_price_pct,
@@ -86,19 +88,70 @@ class TestFibbLogic(unittest.TestCase):
         self.assertEqual(resolve_entry_qty(2.0, 250_000.0, 100_000.0, params), 0.0)
 
     def test_bracket_prices_long(self):
-        params = FibbParams(use_channel_tp=False, tp_pct=0.01, sl_pct=0.01)
+        params = FibbParams(tp_mode=0, tp_pct=0.01, sl_pct=0.01)
         tp, sl = bracket_prices("LONG", 100.0, params)
         self.assertAlmostEqual(tp, 101.0)
         self.assertAlmostEqual(sl, 99.0)
 
-    def test_channel_tp_t1_short_targets_basis(self):
-        bar = pd.Series(
-            {"basis": 95.0, "top1": 100.0, "top2": 105.0, "bott1": 90.0}
+    def test_refresh_reprice_tp_to_basis(self):
+        leg = OpenLeg(
+            entry_id="B1 Long",
+            side="LONG",
+            qty=0.01,
+            entry_time=pd.Timestamp("2024-06-01", tz="UTC"),
+            entry_price=100.0,
+            take_profit_price=100.5,
+            stop_loss_price=None,
+            band="bott1",
+            take_profit_band="",
         )
-        params = FibbParams(use_channel_tp=True)
+        open_legs = {"B1 Long": leg}
+        bar = pd.Series({"basis": 99.0})
+        refresh_reprice_tp_to_basis(
+            open_legs, bar, FibbParams(tp_mode=1)
+        )
+        self.assertAlmostEqual(leg.take_profit_price, 99.0)
+        self.assertEqual(leg.take_profit_band, "basis")
+        refresh_reprice_tp_to_basis(
+            open_legs, bar, FibbParams(tp_mode=0)
+        )
+        self.assertAlmostEqual(leg.take_profit_price, 99.0)
+
+    def test_channel_tp_two_gap_offset(self):
+        from fibb_trading.core.fibb_config import channel_tp_target_band
+
+        off = 2
+        self.assertEqual(channel_tp_target_band("B3 Long", "LONG", off), "bott1")
+        self.assertEqual(channel_tp_target_band("B1 Long", "LONG", off), "top1")
+        self.assertEqual(channel_tp_target_band("T3 Short", "SHORT", off), "top1")
+        self.assertEqual(channel_tp_target_band("T1 Short", "SHORT", off), "bott1")
+        self.assertEqual(channel_tp_target_band("B2 Long", "LONG", off), "basis")
+        self.assertEqual(channel_tp_target_band("T2 Short", "SHORT", off), "basis")
+
+    def test_channel_tp_offset_from_params(self):
+        params = FibbParams(tp_mode=3, channel_tp_offset=1)
+        tp, band = resolve_take_profit(
+            "B3 Long", "LONG", 80.0, pd.Series({"bott2": 85.0, "bott3": 80.0}), params
+        )
+        self.assertEqual(band, "bott2")
+        self.assertAlmostEqual(tp, 85.0)
+
+    def test_channel_tp_t1_short_targets_bott1(self):
+        bar = pd.Series(
+            {
+                "basis": 95.0,
+                "top1": 100.0,
+                "top2": 105.0,
+                "top3": 110.0,
+                "bott1": 90.0,
+                "bott2": 85.0,
+                "bott3": 80.0,
+            }
+        )
+        params = FibbParams(tp_mode=2)
         tp, band = resolve_take_profit("T1 Short", "SHORT", 100.0, bar, params)
-        self.assertEqual(band, "basis")
-        self.assertAlmostEqual(tp, 95.0)
+        self.assertEqual(band, "bott1")
+        self.assertAlmostEqual(tp, 90.0)
         leg = OpenLeg(
             entry_id="T1 Short",
             side="SHORT",
@@ -108,11 +161,45 @@ class TestFibbLogic(unittest.TestCase):
             take_profit_price=tp,
             stop_loss_price=None,
             band="top1",
-            take_profit_band="basis",
+            take_profit_band="bott1",
         )
-        price, reason = try_exit_leg(leg, high=99.0, low=94.0)
+        price, reason = try_exit_leg(leg, high=99.0, low=89.0)
         self.assertEqual(reason, "TAKE_PROFIT")
-        self.assertAlmostEqual(price, 95.0)
+        self.assertAlmostEqual(price, 90.0)
+
+    def test_channel_tp_fixed_does_not_refresh_each_bar(self):
+        leg = OpenLeg(
+            entry_id="B1 Long",
+            side="LONG",
+            qty=0.01,
+            entry_time=pd.Timestamp("2024-06-01", tz="UTC"),
+            entry_price=80.0,
+            take_profit_price=100.0,
+            stop_loss_price=None,
+            band="bott1",
+            take_profit_band="top1",
+        )
+        open_legs = {"B1 Long": leg}
+        bar = pd.Series({"top1": 98.0, "bott1": 80.0})
+        refresh_channel_take_profits(open_legs, bar, FibbParams(tp_mode=3))
+        self.assertAlmostEqual(leg.take_profit_price, 100.0)
+        refresh_channel_take_profits(open_legs, bar, FibbParams(tp_mode=2))
+        self.assertAlmostEqual(leg.take_profit_price, 98.0)
+
+    def test_channel_tp_b3_long_targets_bott1(self):
+        bar = pd.Series(
+            {
+                "basis": 95.0,
+                "top1": 100.0,
+                "bott1": 90.0,
+                "bott2": 85.0,
+                "bott3": 80.0,
+            }
+        )
+        params = FibbParams(tp_mode=2)
+        tp, band = resolve_take_profit("B3 Long", "LONG", 80.0, bar, params)
+        self.assertEqual(band, "bott1")
+        self.assertAlmostEqual(tp, 90.0)
 
     def test_channels_have_columns(self):
         df = compute_fibb_channels(self._sample_bars(), FibbParams(length=5))
@@ -143,7 +230,7 @@ class TestFibbLogic(unittest.TestCase):
         self.assertEqual(reason, "STOP_LOSS")
 
     def test_outer_legs_skip_pct_stop_in_deferred_sl_mode(self):
-        params = FibbParams(use_deferred_channel_sl=True, use_channel_tp=False)
+        params = FibbParams(use_deferred_channel_sl=True, tp_mode=0)
         for entry_id in ("T1 Short", "T3 Short", "B1 Long", "B3 Long"):
             self.assertFalse(uses_deferred_channel_sl(entry_id, params))
         self.assertTrue(uses_deferred_channel_sl("T2 Short", params))
@@ -170,7 +257,7 @@ class TestFibbLogic(unittest.TestCase):
             tp_pct=0.01,
             sl_pct=0.01,
             use_deferred_channel_sl=True,
-            use_channel_tp=False,
+            tp_mode=0,
         )
         leg = OpenLeg(
             entry_id="T2 Short",

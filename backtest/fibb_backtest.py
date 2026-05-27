@@ -2,6 +2,7 @@ import path_setup  # noqa: F401, E402
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +11,13 @@ import pandas as pd
 
 from fibb_trading.backtest.backtest_io import ensure_test_data_dir
 from fibb_trading.core.data_fetch import fetch_binance_futures_klines, interval_to_ms, parse_time
-from fibb_trading.core.fibb_config import FibbParams
+from fibb_trading.core.fibb_config import (
+    FibbParams,
+    normalize_channel_tp_offset,
+    normalize_tp_mode,
+)
+from fibb_trading.core.fibb_env import configure_strategy_from_env, indicator_history_bars
+from fibb_trading.env_loader import load_fibb_env
 from fibb_trading.core.fibb_logic import (
     compute_fibb_channels,
     leg_summary,
@@ -23,9 +30,8 @@ INTERVAL = "15m"
 _BACKTEST_ROOT = Path(__file__).resolve().parent
 
 # 與先前延遲止損回測一致（約 2026-02-24～2026-05-26，本機時區）
-DEFAULT_START = "2024-01-01 00:00:00"
+DEFAULT_START = "2025-01-01 00:00:00"
 DEFAULT_END = "2026-05-26 23:59:59"
-WARMUP_BARS = 50  # length=20 + buffer
 
 
 def resolve_period(
@@ -82,18 +88,49 @@ def plot_results(klines: pd.DataFrame, trades: pd.DataFrame, out_dir: Path) -> l
 
 
 def parse_args(argv=None):
+    load_fibb_env()
+    env_p = configure_strategy_from_env(reload_env=False)
+
     p = argparse.ArgumentParser(description="FiBB 15m BTC layer strategy backtest")
     p.add_argument("--start", type=parse_time, help=f"UTC start, e.g. {DEFAULT_START}")
     p.add_argument("--end", type=parse_time, help=f"UTC end, e.g. {DEFAULT_END}")
-    p.add_argument("--symbol", default=SYMBOL)
-    p.add_argument("--interval", default=INTERVAL)
-    p.add_argument("--length", type=int, default=20)
-    p.add_argument("--tp-pct", type=float, default=0.5, help="Take profit %% when --pct-tp (e.g. 0.5)")
-    p.add_argument("--sl-pct", type=float, default=0.5, help="Stop loss %% when --pct-tp")
+    p.add_argument("--symbol", default=os.getenv("FIBB_SYMBOL", SYMBOL))
+    p.add_argument("--interval", default=os.getenv("FIBB_INTERVAL", INTERVAL))
+    p.add_argument("--length", type=int, default=env_p.length)
+    p.add_argument(
+        "--tp-pct",
+        type=float,
+        default=env_p.tp_pct * 100.0,
+        help="Take profit %% when --pct-tp (e.g. 0.5)",
+    )
+    p.add_argument(
+        "--sl-pct",
+        type=float,
+        default=env_p.sl_pct * 100.0,
+        help="Stop loss %% when --pct-tp",
+    )
+    p.add_argument(
+        "--tp-mode",
+        type=int,
+        choices=[0, 1, 2, 3],
+        default=None,
+        help="TP: 0=fixed %%, 1=basis/bar, 2=channel/bar, 3=channel locked at entry",
+    )
+    p.add_argument(
+        "--channel-tp-offset",
+        type=int,
+        default=None,
+        help="Steps toward center for tp_mode 2/3 (default from FIBB_CHANNEL_TP_OFFSET)",
+    )
     p.add_argument(
         "--channel-tp",
         action="store_true",
-        help="Channel take profit (T1->basis, T2->top1, …); default is fixed %% TP",
+        help=argparse.SUPPRESS,  # legacy -> --tp-mode 2
+    )
+    p.add_argument(
+        "--no-reprice-tp-to-basis",
+        action="store_true",
+        help=argparse.SUPPRESS,  # legacy -> --tp-mode 0
     )
     p.add_argument(
         "--pct-tp",
@@ -103,14 +140,14 @@ def parse_args(argv=None):
     p.add_argument(
         "--fee-rate",
         type=float,
-        default=0.0002,
+        default=env_p.fee_rate,
         help="Commission rate per side (0 = match TradingView default)",
     )
-    p.add_argument("--initial-capital", type=float, default=100_000.0)
+    p.add_argument("--initial-capital", type=float, default=env_p.initial_capital)
     p.add_argument(
         "--leverage",
         type=float,
-        default=2.0,
+        default=env_p.leverage,
         help="Max notional = equity × leverage (match TV strategy properties)",
     )
     p.add_argument("--output-dir", default=None)
@@ -131,12 +168,15 @@ def main(
     test_data_dir = ensure_test_data_dir(out_dir / "test_data")
 
     if params is None:
-        params = FibbParams()
+        params = configure_strategy_from_env(reload_env=True)
 
+    history_bars = indicator_history_bars(params.length)
     start_ts = pd.to_datetime(start, unit="s", utc=True)
     end_ts = pd.to_datetime(end, unit="s", utc=True)
     step = interval_to_ms(interval)
-    fetch_start_ms = int((start_ts - pd.Timedelta(milliseconds=step * WARMUP_BARS)).timestamp() * 1000)
+    fetch_start_ms = int(
+        (start_ts - pd.Timedelta(milliseconds=step * history_bars)).timestamp() * 1000
+    )
     end_ms = int(end_ts.timestamp() * 1000)
 
     print(f"Fetching {symbol} {interval} klines: {fetch_start_ms} -> {end_ms}")
@@ -181,16 +221,37 @@ def main(
     print(json.dumps(summary, indent=2))
 
 
+def _resolve_cli_tp_mode(cli, env_p: FibbParams) -> int:
+    if cli.tp_mode is not None:
+        return normalize_tp_mode(cli.tp_mode)
+    if cli.channel_tp and not cli.pct_tp:
+        return 2
+    if cli.no_reprice_tp_to_basis:
+        return 0
+    return env_p.tp_mode
+
+
 if __name__ == "__main__":
     cli = parse_args()
+    env_p = configure_strategy_from_env(reload_env=False)
     params = FibbParams(
         length=cli.length,
         tp_pct=cli.tp_pct / 100.0,
         sl_pct=cli.sl_pct / 100.0,
+        fib_ratio_1=env_p.fib_ratio_1,
+        fib_ratio_2=env_p.fib_ratio_2,
+        fib_ratio_3=env_p.fib_ratio_3,
         fee_rate=cli.fee_rate,
+        max_open_legs=env_p.max_open_legs,
         initial_capital=cli.initial_capital,
         leverage=cli.leverage,
-        use_channel_tp=cli.channel_tp and not cli.pct_tp,
+        use_deferred_channel_sl=env_p.use_deferred_channel_sl,
+        tp_mode=_resolve_cli_tp_mode(cli, env_p),
+        channel_tp_offset=(
+            normalize_channel_tp_offset(cli.channel_tp_offset)
+            if cli.channel_tp_offset is not None
+            else env_p.channel_tp_offset
+        ),
     )
     main(
         start=cli.start,

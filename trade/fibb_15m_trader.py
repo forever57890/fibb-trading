@@ -21,7 +21,11 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from fibb_trading.core.data_fetch import fetch_binance_futures_klines, interval_to_ms
-from fibb_trading.core.fibb_config import FibbParams
+from fibb_trading.core.fibb_env import (
+    configure_strategy_from_env,
+    indicator_history_bars,
+    params_snapshot_dict,
+)
 from fibb_trading.core.fibb_logic import compute_fibb_channels
 from fibb_trading.env_loader import load_fibb_env
 from fibb_trading.trade.exchange import (
@@ -43,6 +47,7 @@ from fibb_trading.trade.runtime_io import (
 )
 
 load_fibb_env()
+_STRATEGY_PARAMS = configure_strategy_from_env(reload_env=False)
 
 _TRADE_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("FIBB_RUNTIME_DIR", str(_TRADE_ROOT / "runtime")))
@@ -52,47 +57,20 @@ LOG_FILE = RUNTIME_DIR / "fibb_15m_runs.log"
 SYMBOL = os.getenv("FIBB_SYMBOL", "BTCUSDT")
 INTERVAL = os.getenv("FIBB_INTERVAL", "15m")
 DRY_RUN = os.getenv("FIBB_DRY_RUN", "1") == "1"
-WARMUP_BARS = int(os.getenv("FIBB_WARMUP_BARS", "50"))
 IGNORE_STATE = os.getenv("FIBB_IGNORE_STATE", "0") == "1"
 FORCE_BAR_TIME = os.getenv("FIBB_FORCE_BAR_TIME")  # ISO open_time for replay
-# 1 = 每根 K 將持倉 TP 重掛至 basis（中線）；0 = 維持開倉時的固定 % TP
-REPRICE_TP_TO_BASIS = os.getenv("FIBB_REPRICE_TP_TO_BASIS", "1") == "1"
-
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_params() -> FibbParams:
-    return FibbParams(
-        length=int(os.getenv("FIBB_LENGTH", "50")),
-        tp_pct=float(os.getenv("FIBB_TP_PCT", "0.5")) / 100.0,
-        sl_pct=float(os.getenv("FIBB_SL_PCT", "0.5")) / 100.0,
-        fee_rate=float(os.getenv("FIBB_FEE_RATE", "0")),
-        initial_capital=float(os.getenv("FIBB_INITIAL_CAPITAL", "100000")),
-        leverage=float(os.getenv("FIBB_LEVERAGE", "150")),
-        use_deferred_channel_sl=os.getenv("FIBB_DEFERRED_SL", "1") == "1",
-        use_channel_tp=os.getenv("FIBB_CHANNEL_TP", "0") == "1",
-    )
-
-
-def build_config_snapshot() -> Dict[str, Any]:
-    p = build_params()
+def build_config_snapshot(params=None) -> Dict[str, Any]:
+    p = params or configure_strategy_from_env(reload_env=True)
     return {
         "symbol": SYMBOL,
         "interval": INTERVAL,
         "dry_run": DRY_RUN,
-        "warmup_bars": WARMUP_BARS,
-        "reprice_tp_to_basis": REPRICE_TP_TO_BASIS,
-        "params": {
-            "length": p.length,
-            "tp_pct": p.tp_pct,
-            "use_deferred_channel_sl": p.use_deferred_channel_sl,
-            "use_channel_tp": p.use_channel_tp,
-            "initial_capital": p.initial_capital,
-            "leverage": p.leverage,
-            "fee_rate": p.fee_rate,
-        },
+        "tp_mode": p.tp_mode,
+        "params": params_snapshot_dict(p),
         "has_api_keys": bool(os.getenv("bn_api_key") and os.getenv("bn_api_secret")),
     }
 
@@ -110,10 +88,11 @@ def append_log(record: dict) -> None:
     safe_append_log(LOG_FILE, format_run_log_block(record))
 
 
-def fetch_klines() -> pd.DataFrame:
+def fetch_klines(params) -> pd.DataFrame:
     step = interval_to_ms(INTERVAL)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = now_ms - step * (WARMUP_BARS + 5)
+    bars = indicator_history_bars(params.length)
+    start_ms = now_ms - step * bars
     klines = fetch_binance_futures_klines(SYMBOL, INTERVAL, start_ms, now_ms)
     return klines
 
@@ -130,11 +109,11 @@ def wallet_equity_usdt(trader) -> Optional[float]:
 
 def run_once() -> Dict[str, Any]:
     ensure_runtime_dir(RUNTIME_DIR)
-    params = build_params()
+    params = configure_strategy_from_env(reload_env=True)
     state = load_state()
     record: Dict[str, Any] = {
         "run_at": utc_now_iso(),
-        "config": build_config_snapshot(),
+        "config": build_config_snapshot(params),
         "state_before": state.to_dict(),
     }
 
@@ -153,7 +132,7 @@ def run_once() -> Dict[str, Any]:
         except Exception as exc:
             record["account_before_error"] = str(exc)
 
-    klines = fetch_klines()
+    klines = fetch_klines(params)
     df = compute_fibb_channels(klines, params)
 
     if FORCE_BAR_TIME:
@@ -176,10 +155,10 @@ def run_once() -> Dict[str, Any]:
         symbol=SYMBOL,
         dry_run=DRY_RUN,
         wallet_equity=equity,
-        reprice_tp_to_basis=REPRICE_TP_TO_BASIS,
     )
     record["bar"] = bar_log
     record["bar_index"] = bar_index
+    record["klines_count"] = len(df)
     record["channels_at_bar"] = {
         k: float(df.iloc[bar_index][k])
         for k in ("basis", "top1", "top2", "top3", "bott1", "bott2", "bott3")

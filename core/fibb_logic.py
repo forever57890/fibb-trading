@@ -4,7 +4,7 @@ FiBB 通道策略邏輯（對應 Pine Script「FiBB 15m BTC Layer Strategy」）
 通道：basis = SMA(close, len)，偏移 = ta.atr(len) × Fibonacci 倍率（Wilder RMA）。
 進場：價格由內向外穿越 T1/T2/T3 做空、B1/B2/B3 做多（每 leg 獨立持倉）。
 出場：預設全 leg 固定 % 止盈；T1/T3/B1/B3 無止損；T2/B2 觸 T3/B3 後以 T2/B2 通道價止損。
-可選 use_channel_tp 改為通道止盈。
+止盈模式由 FibbParams.tp_mode 控制（0=固定 %，1=basis，2=通道隨 K，3=通道鎖定）。
 """
 
 from __future__ import annotations
@@ -14,14 +14,15 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from fibb_trading.core import fibb_config
 from fibb_trading.core.fibb_config import (
-    ALL_LEGS,
-    CHANNEL_TP_TARGET,
+    CHANNEL_TP_ENTRY_INDEX,
+    channel_tp_target_band,
+    tp_mode_channel_tracks_bar,
+    tp_mode_uses_channel,
     DEFERRED_CHANNEL_SL,
     DEFAULT_PARAMS,
     FibbParams,
-    LONG_LEGS,
-    SHORT_LEGS,
 )
 
 
@@ -120,7 +121,7 @@ def analyze_entry_legs(
     status: channels_not_ready | already_open | touch_signal | no_touch
     """
     rows: List[dict] = []
-    for entry_id, side, qty, band in ALL_LEGS:
+    for entry_id, side, qty, band in fibb_config.ALL_LEGS:
         level = curr.get(band)
         prev_level = prev.get(band)
         row: dict = {
@@ -131,7 +132,21 @@ def analyze_entry_legs(
         }
         if pd.isna(level) or pd.isna(prev_level):
             row["status"] = "channels_not_ready"
-            row["reason"] = f"通道 {band} 尚未就緒（暖機中）"
+            row["reason"] = f"通道 {band} 尚未就緒（歷史 K 不足，無法計算 SMA/ATR）"
+            if side == "SHORT":
+                row["touch"] = {
+                    "high": float(curr["high"]) if pd.notna(curr.get("high")) else None,
+                    "prev_high": float(prev["high"]) if pd.notna(prev.get("high")) else None,
+                    "band": None,
+                    "prev_band": None,
+                }
+            else:
+                row["touch"] = {
+                    "low": float(curr["low"]) if pd.notna(curr.get("low")) else None,
+                    "prev_low": float(prev["low"]) if pd.notna(prev.get("low")) else None,
+                    "band": None,
+                    "prev_band": None,
+                }
             rows.append(row)
             continue
 
@@ -240,12 +255,12 @@ def detect_entry_signals(
     回傳本根 K 線收盤可開倉的 leg 列表：(entry_id, side, qty, band_col)。
     """
     signals: List[Tuple[str, str, float, str]] = []
-    for entry_id, side, qty, band in SHORT_LEGS:
+    for entry_id, side, qty, band in fibb_config.SHORT_LEGS:
         if entry_id in open_entry_ids:
             continue
         if _touch_short(curr, prev, band):
             signals.append((entry_id, side, qty, band))
-    for entry_id, side, qty, band in LONG_LEGS:
+    for entry_id, side, qty, band in fibb_config.LONG_LEGS:
         if entry_id in open_entry_ids:
             continue
         if _touch_long(curr, prev, band):
@@ -256,18 +271,20 @@ def detect_entry_signals(
 def take_profit_price_pct(
     side: str, entry_price: float, params: FibbParams = DEFAULT_PARAMS
 ) -> float:
-    """固定百分比止盈（use_channel_tp=False 時使用）。"""
+    """固定百分比止盈（tp_mode=0 或進場暫用 % 時）。"""
     if side == "LONG":
         return entry_price * (1 + params.tp_pct)
     return entry_price * (1 - params.tp_pct)
 
 
 def uses_channel_tp(entry_id: str, params: FibbParams) -> bool:
-    return params.use_channel_tp and entry_id in CHANNEL_TP_TARGET
+    return tp_mode_uses_channel(params) and entry_id in CHANNEL_TP_ENTRY_INDEX
 
 
-def channel_tp_level(entry_id: str, bar: pd.Series) -> float:
-    col = CHANNEL_TP_TARGET[entry_id]
+def channel_tp_level(
+    entry_id: str, side: str, bar: pd.Series, channel_tp_offset: int
+) -> float:
+    col = channel_tp_target_band(entry_id, side, channel_tp_offset)
     level = bar[col]
     if pd.isna(level):
         raise ValueError(f"Channel TP level {col} is NaN for {entry_id}")
@@ -278,7 +295,7 @@ def refresh_channel_take_profits(
     open_legs: Dict[str, OpenLeg], curr: pd.Series, params: FibbParams
 ) -> None:
     """持倉期間每根 K 更新通道止盈價（軌道隨 SMA/ATR 移動）。"""
-    if not params.use_channel_tp:
+    if not tp_mode_channel_tracks_bar(params):
         return
     for leg in open_legs.values():
         if not leg.take_profit_band:
@@ -288,14 +305,44 @@ def refresh_channel_take_profits(
             leg.take_profit_price = float(level)
 
 
+def refresh_reprice_tp_to_basis(
+    open_legs: Dict[str, OpenLeg], curr: pd.Series, params: FibbParams
+) -> None:
+    """
+    持倉期間每根 K 將所有未平 leg 的止盈價改為當根 basis（與實盤 FIBB_REPRICE_TP_TO_BASIS 一致）。
+    應在當根出場檢查之後、新開倉之前呼叫（新倉本根仍用進場 % TP，下一根才跟 basis）。
+    """
+    if params.tp_mode != 1:
+        return
+    basis = curr.get("basis")
+    if pd.isna(basis):
+        return
+    basis_tp = float(basis)
+    for leg in open_legs.values():
+        leg.take_profit_price = basis_tp
+        leg.take_profit_band = "basis"
+
+
 def resolve_take_profit(
     entry_id: str, side: str, entry_price: float, bar: pd.Series, params: FibbParams
 ) -> Tuple[float, str]:
     """回傳 (止盈價, 止盈通道欄位名；% 模式時欄位名為空字串)。"""
     if uses_channel_tp(entry_id, params):
-        col = CHANNEL_TP_TARGET[entry_id]
-        return channel_tp_level(entry_id, bar), col
+        col = channel_tp_target_band(entry_id, side, params.channel_tp_offset)
+        return channel_tp_level(entry_id, side, bar, params.channel_tp_offset), col
     return take_profit_price_pct(side, entry_price, params), ""
+
+
+def resolve_entry_take_profit(
+    entry_id: str, side: str, entry_price: float, bar: pd.Series, params: FibbParams
+) -> Tuple[float, str]:
+    """
+    開倉當下止盈價。
+    tp_mode=1：先固定 %（下一根 K 才跟 basis）；0/2 見 resolve_take_profit。
+    """
+    if params.tp_mode == 1:
+        return take_profit_price_pct(side, entry_price, params), ""
+    return resolve_take_profit(entry_id, side, entry_price, bar, params)
 
 
 def bracket_prices(
@@ -487,6 +534,8 @@ def run_fibb_backtest(
             )
             del open_legs[entry_id]
 
+        refresh_reprice_tp_to_basis(open_legs, curr, params)
+
         # --- entries at close (Pine: inDateRange only) ---
         if not in_entry_range:
             continue
@@ -501,7 +550,9 @@ def run_fibb_backtest(
             qty = resolve_entry_qty(qty, close_price, equity, params)
             if qty <= 0:
                 continue
-            tp, tp_band = resolve_take_profit(entry_id, side, close_price, curr, params)
+            tp, tp_band = resolve_entry_take_profit(
+                entry_id, side, close_price, curr, params
+            )
             if uses_deferred_channel_sl(entry_id, params):
                 # T2/B2：進場無止損，外層觸軌後由 arm_deferred_channel_stops 啟用通道止損
                 sl: Optional[float] = None

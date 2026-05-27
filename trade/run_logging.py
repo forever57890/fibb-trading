@@ -74,8 +74,8 @@ def build_bar_headline(bar: dict) -> tuple[str, str]:
                 "SKIPPED_ALREADY_PROCESSED",
                 f"略過：K 線 {bar.get('bar_time', '?')} 已處理過",
             )
-        if reason == "warmup":
-            return ("SKIPPED_WARMUP", "略過：暖機不足，尚無有效通道")
+        if reason == "insufficient_history":
+            return ("SKIPPED_INSUFFICIENT_HISTORY", "略過：歷史 K 線不足，無法計算通道")
         return ("SKIPPED", f"略過：{reason}")
 
     exits = bar.get("exits") or []
@@ -146,8 +146,14 @@ def build_action_detail(result: dict) -> Dict[str, Any]:
         detail["bar_time"] = bar.get("bar_time")
         if bar.get("reason") == "already_processed":
             detail["reason_zh"] = "state.last_bar_time 與本根相同，cron 重複執行"
-        elif bar.get("reason") == "warmup":
-            detail["reason_zh"] = "bar_index < 1，通道尚未計算完成"
+        elif bar.get("reason") == "insufficient_history":
+            need = bar.get("need_bar_index_at_least")
+            cnt = bar.get("klines_count")
+            req = bar.get("history_bars_requested")
+            detail["reason_zh"] = (
+                f"歷史 K 不足或通道未就緒（抓到 {cnt} 根，建議請求 {req} 根，"
+                f"bar_index 需 ≥ {need}）"
+            )
     elif action == "ERROR":
         detail["reason"] = result.get("error")
     else:
@@ -208,8 +214,14 @@ def build_run_summary_lines(result: dict) -> List[str]:
     lines.append(
         f"Config: {cfg.get('symbol')} {cfg.get('interval')} dry_run={cfg.get('dry_run')} "
         f"length={p.get('length')} tp%={float(p.get('tp_pct', 0)) * 100} "
-        f"deferred_sl={p.get('use_deferred_channel_sl')} "
-        f"reprice_tp_to_basis={cfg.get('reprice_tp_to_basis')}"
+        f"qty={p.get('qty_t1')}/{p.get('qty_t2')}/{p.get('qty_t3')} "
+        f"leverage={p.get('leverage')} deferred_sl={p.get('use_deferred_channel_sl')} "
+        f"tp_mode={p.get('tp_mode')} ({p.get('tp_mode_label', '?')})"
+        + (
+            f" channel_tp_offset={p.get('channel_tp_offset')}"
+            if p.get("tp_mode") in (2, 3)
+            else ""
+        )
     )
 
     state_before = result.get("state_before") or {}
@@ -251,6 +263,13 @@ def build_run_summary_lines(result: dict) -> List[str]:
     if bar.get("close") is not None:
         lines.append(f"Bar: time={bar.get('bar_time')} close={bar.get('close')}")
 
+    for mm in bar.get("position_mismatch") or []:
+        lines.append(
+            f"  ⚠ 倉位對帳: {mm.get('side')} 交易所={mm.get('exchange_amt')} "
+            f"虛擬 leg 合計={mm.get('virtual_amt')} 多出={mm.get('excess')} "
+            f"open={mm.get('open_leg_ids')}"
+        )
+
     for ex in bar.get("exits") or []:
         tr = ex.get("trade") or {}
         lines.append(
@@ -265,12 +284,39 @@ def build_run_summary_lines(result: dict) -> List[str]:
         ex = ent.get("exchange") or {}
         tp_algo = ent.get("tp_algo_id") or ex.get("tp_algo_id")
         tp_price = ex.get("take_profit_price")
+        fill_entry = ex.get("fill_entry_price")
+        signal_close = ex.get("signal_close")
         lines.append(
             f"  ENTRY {ent.get('entry_id')}: {ent.get('side')} qty={ent.get('qty')} "
             f"status={ex.get('status', ex)}"
+            + (f" fill={fill_entry}" if fill_entry else "")
+            + (f" signal_close={signal_close}" if signal_close and fill_entry != signal_close else "")
             + (f" tp={tp_price}" if tp_price else "")
             + (f" tp_algo_id={tp_algo}" if tp_algo else " tp_algo_id=(none)")
         )
+        req = ex.get("requested_qty")
+        pre_fill = ex.get("pre_limit_filled_qty")
+        ioc_fill = ex.get("ioc_filled_qty")
+        mkt_fill = ex.get("market_remainder_qty")
+        final_fill = ex.get("final_leg_filled_qty")
+        if req is not None:
+            pos_before = ex.get("position_before")
+            pos_after = ex.get("position_after")
+            pos_delta = ex.get("position_delta")
+            lines.append(
+                f"    fills: req={req} pre={pre_fill} ioc={ioc_fill} market={mkt_fill} "
+                f"final={final_fill}"
+                + (
+                    f" | pos {pos_before}->{pos_after} (Δ{pos_delta})"
+                    if pos_before is not None and pos_after is not None
+                    else ""
+                )
+            )
+        if ent.get("overfill_warning"):
+            lines.append(
+                f"    ⚠ 超買: 本 leg 請求 {req} 但交易所淨增 {ex.get('position_delta')} "
+                f"(overfill={ent.get('overfill_qty') or ex.get('overfill_qty')})"
+            )
 
     if bar.get("tp_reprice_note"):
         lines.append(f"  {bar.get('tp_reprice_note')}")

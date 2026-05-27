@@ -320,6 +320,22 @@ class BinanceFuturesTrader:
         """POST /fapi/v1/order (signed TRADE endpoint)."""
         return self._signed_post("/fapi/v1/order", params)
 
+    def get_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """GET /fapi/v1/order — query a single order by orderId."""
+        return self._signed_get(
+            "/fapi/v1/order",
+            {"symbol": symbol, "orderId": int(order_id)},
+        )
+
+    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """DELETE /fapi/v1/order — cancel one regular order (not algo TP/SL)."""
+        return self._request(
+            "DELETE",
+            "/fapi/v1/order",
+            params={"symbol": symbol, "orderId": int(order_id)},
+            signed=True,
+        )
+
     def create_algo_conditional_order(
         self,
         symbol: str,

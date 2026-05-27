@@ -33,11 +33,18 @@
 
 ### 出場（與目前 `FibbParams` 預設一致）
 
-**止盈（預設：`use_channel_tp=False`）**  
-全部 leg：進場收盤價 ± `tp_pct`（預設 0.5%），持倉期間止盈價**不**隨通道重算。
+**止盈（`FIBB_TP_MODE`，預設 `0`）**
 
-**可選：通道止盈（`use_channel_tp=True`）**  
-T1/B1→`basis`；T2/B2→`top1`/`bott1`；T3/B3→`top2`/`bott2`；每根 K 更新止盈價。回測請加：`--channel-tp`。
+| 模式 | 行為 |
+|------|------|
+| `0` | 固定 %：進場價 ± `FIBB_TP_PCT`，持倉不重掛 |
+| `1` | 進場先固定 %，之後每根 K 止盈改為當根 `basis`（實盤會重掛交易所 TP） |
+| `2` | 通道止盈（**隨 K 漂移**）：帶位由 `FIBB_CHANNEL_TP_OFFSET` 決定；每根 K 重算價格並重掛 TP |
+| `3` | 通道止盈（**開倉鎖定**）：同上帶位與 offset，止盈價固定在開倉當下，不重掛 |
+
+`FIBB_CHANNEL_TP_OFFSET`（預設 `2`）：沿通道階梯向中線偏移格數（例：`2` → B3 止盈在 B1；`1` → B3 在 B2）。**僅 tp_mode 2/3 有效。**
+
+回測可用 `--tp-mode 0|1|2|3` 覆寫 `.env`。
 
 **止損（預設：`use_deferred_channel_sl=True`）**
 
@@ -147,30 +154,26 @@ python3 -m fibb_trading.backtest.fibb_backtest
 
 ### 1) 準備 `.env`
 
-在專案根目錄建立 `.env`（可參考 `.env.example`）：
+在專案根目錄建立 `.env`（完整範本見 `.env.example`）。**回測與實盤共用**下列策略變數：
 
-```env
-bn_api_key=your_key
-bn_api_secret=your_secret
+| 變數 | 說明 |
+|------|------|
+| `FIBB_LENGTH` | SMA / ATR 週期（預設 20） |
+| `FIBB_TP_PCT` / `FIBB_SL_PCT` | 止盈 / 止損 %（如 `0.5` = 0.5%） |
+| `FIBB_QTY_T1` / `T2` / `T3` | 各 leg 下單量 BTC（T1/B1、T2/B2、T3/B3） |
+| `FIBB_FIB_RATIO_1/2/3` | 費波通道倍率 |
+| `FIBB_FEE_RATE` | 單邊佣金率 |
+| `FIBB_MAX_OPEN_LEGS` | 最多同時持倉 leg 數 |
+| `FIBB_INITIAL_CAPITAL` / `FIBB_LEVERAGE` | 資金與槓桿（縮單用） |
+| `FIBB_DEFERRED_SL` | 1 = T2/B2 延遲通道止損 |
+| `FIBB_TP_MODE` | `0` 固定 %；`1` 跟 basis；`2` 通道隨 K；`3` 通道鎖定（見上表） |
+| `FIBB_CHANNEL_TP_OFFSET` | tp_mode 2/3：進場帶向中線偏移格數（預設 `2`） |
+| `FIBB_CHANNEL_TP` | （舊）`1` → 等同 `FIBB_TP_MODE=2` |
+| `FIBB_REPRICE_TP_TO_BASIS` | （舊）`1` → 等同 `FIBB_TP_MODE=1` |
 
-# 先用模擬模式驗證流程
-FIBB_DRY_RUN=1
+實盤另需：`bn_api_key`、`bn_api_secret`、`FIBB_DRY_RUN`、`FIBB_ENABLE_HEDGE_MODE`、`FIBB_SYMBOL` 等（見 `.env.example`）。
 
-# 首次可設 1，自動嘗試切換為雙向持倉（hedge mode）
-FIBB_ENABLE_HEDGE_MODE=1
-
-# 策略參數（與 Python 預設一致）
-FIBB_SYMBOL=BTCUSDT
-FIBB_TP_PCT=0.5
-FIBB_DEFERRED_SL=1
-FIBB_CHANNEL_TP=0
-FIBB_FEE_RATE=0
-FIBB_INITIAL_CAPITAL=100000
-FIBB_LEVERAGE=2
-
-# 開倉後先掛固定 % TP；之後每 15m 依 basis（中線）重掛 TP（1=開，0=關）
-FIBB_REPRICE_TP_TO_BASIS=1
-```
+回測 CLI（`--length`、`--tp-pct` 等）仍可覆寫 `.env`；未傳 CLI 時以 `.env` 為準。
 
 ### 2) 單次執行（手動）
 
@@ -211,7 +214,7 @@ TZ=UTC
 
 每次執行會輸出 **本根總結**（例如「本根無觸軌進場」「T1 Short 已有持倉」）及 **Leg 進場診斷**（六個 leg 是否觸軌、high/low 與通道價對照）。有持倉時會列出 **HOLD** 與止盈/止損價是否觸及。
 
-環境變數：`FIBB_LOG_JSON=0` 可關閉 runs.log 內的 JSON 區塊；`FIBB_PRINT_JSON=1` 可在終端額外印完整 JSON。`FIBB_REPRICE_TP_TO_BASIS=0` 時持倉 TP 維持開倉時的固定 %，不每根 K 重掛至中線。
+環境變數：`FIBB_LOG_JSON=0` 可關閉 runs.log 內的 JSON 區塊；`FIBB_PRINT_JSON=1` 可在終端額外印完整 JSON。`FIBB_TP_MODE=0` 時持倉 TP 維持開倉時的固定 %，不重掛。
 
 ### 5) 重要風險與檢查
 
