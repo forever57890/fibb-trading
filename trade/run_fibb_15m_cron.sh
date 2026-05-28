@@ -13,7 +13,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PKG_PARENT="$(cd "$REPO_ROOT/.." && pwd)"
 RUNTIME_DIR="${FIBB_RUNTIME_DIR:-$SCRIPT_DIR/runtime}"
 CRON_LOG="${FIBB_CRON_LOG:-$RUNTIME_DIR/fibb_cron.log}"
 mkdir -p "$RUNTIME_DIR"
@@ -21,9 +20,6 @@ mkdir -p "$RUNTIME_DIR"
 exec >>"$CRON_LOG" 2>&1
 
 echo "[cron] ===== $(date -u +%Y-%m-%dT%H:%M:%SZ) start ====="
-
-export PYTHONPATH="${PKG_PARENT}:${PYTHONPATH:-}"
-cd "$PKG_PARENT"
 
 if [ -f "$REPO_ROOT/.env" ]; then
   set -a
@@ -42,7 +38,7 @@ resolve_python() {
   fi
   for candidate in \
     "$REPO_ROOT/.venv/bin/python3" \
-    "$PKG_PARENT/.venv/bin/python3" \
+    "$REPO_ROOT/../.venv/bin/python3" \
     "$(command -v python3 2>/dev/null || true)"
   do
     [ -n "$candidate" ] && [ -x "$candidate" ] || continue
@@ -54,14 +50,49 @@ resolve_python() {
   return 1
 }
 
+resolve_module() {
+  # Try common layouts:
+  # 1) package layout: <root>/fibb_trading/trade/fibb_15m_trader.py
+  # 2) flat layout:    <root>/trade/fibb_15m_trader.py
+  local roots=(
+    "$REPO_ROOT"
+    "$REPO_ROOT/.."
+    "$(pwd)"
+  )
+  local root module
+  for root in "${roots[@]}"; do
+    [ -d "$root" ] || continue
+    if [ -f "$root/fibb_trading/trade/fibb_15m_trader.py" ]; then
+      echo "$root|fibb_trading.trade.fibb_15m_trader"
+      return 0
+    fi
+    if [ -f "$root/trade/fibb_15m_trader.py" ]; then
+      echo "$root|trade.fibb_15m_trader"
+      return 0
+    fi
+  done
+  return 1
+}
+
 PYTHON="$(resolve_python)" || {
   echo "[cron] ERROR: no python3 with pandas"
   exit 127
 }
 
-echo "[cron] python=$PYTHON dry_run=$FIBB_DRY_RUN"
+module_info="$(resolve_module)" || {
+  echo "[cron] ERROR: cannot locate fibb_15m_trader module root"
+  exit 127
+}
+MODULE_ROOT="${module_info%%|*}"
+ENTRY_MODULE="${module_info##*|}"
 
-"$PYTHON" -m fibb_trading.trade.fibb_15m_trader
+export PYTHONPATH="${MODULE_ROOT}:${PYTHONPATH:-}"
+cd "$MODULE_ROOT"
+
+echo "[cron] python=$PYTHON dry_run=$FIBB_DRY_RUN"
+echo "[cron] module_root=$MODULE_ROOT entry_module=$ENTRY_MODULE"
+
+"$PYTHON" -m "$ENTRY_MODULE"
 exit_code=$?
 echo "[cron] ===== $(date -u +%Y-%m-%dT%H:%M:%SZ) done exit=$exit_code ====="
 exit "$exit_code"
