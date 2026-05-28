@@ -30,6 +30,73 @@ class FibbParams:
     tp_mode: int = 0
     # tp_mode 2/3：進場帶沿 CHANNEL_LADDER 向中線偏移格數（預設 2 → B3 止盈在 B1）
     channel_tp_offset: int = 2
+    # 持倉逾時強平（小時）；0 = 關閉。逾時以當根收盤價平倉（回測／實盤記帳價）
+    max_holding_hours: float = 24.0
+    # 4H 波動分檔（regime）控制：True 時啟用高波動保守模式
+    regime_enabled: bool = False
+    # 4H 震幅百分位 lookback（根數，例：60 根 4H 約 10 天）
+    regime_h4_lookback: int = 60
+    # 高波動門檻分位（0~1）；例 0.7 = 70 分位
+    regime_h4_high_vol_quantile: float = 0.7
+    # 高波動時 TP 百分比乘數（僅固定 %% TP 路徑生效）
+    regime_high_vol_tp_mult: float = 0.65
+    # 高波動時最大持倉小時（0=不覆寫 max_holding_hours）
+    regime_high_vol_max_holding_hours: float = 18.0
+    # 高波動時限制外層逆勢單（只限制 T3/B3）
+    regime_block_outer_countertrend: bool = True
+    # 允許開倉方向：both | long | short（只影響新進場，既有持倉仍照常平倉）
+    trade_sides: str = "both"
+
+
+TRADE_SIDES_BOTH = "both"
+TRADE_SIDES_LONG = "long"
+TRADE_SIDES_SHORT = "short"
+
+
+def normalize_trade_sides(value: str) -> str:
+    aliases = {
+        "both": TRADE_SIDES_BOTH,
+        "long": TRADE_SIDES_LONG,
+        "short": TRADE_SIDES_SHORT,
+        "long_only": TRADE_SIDES_LONG,
+        "short_only": TRADE_SIDES_SHORT,
+        "long-only": TRADE_SIDES_LONG,
+        "short-only": TRADE_SIDES_SHORT,
+    }
+    key = str(value).strip().lower()
+    if key not in aliases:
+        raise ValueError(
+            f"trade_sides must be both, long, or short (got {value!r})"
+        )
+    return aliases[key]
+
+
+def trade_sides_label(mode: str) -> str:
+    return normalize_trade_sides(mode)
+
+
+def side_entry_allowed(params: FibbParams, side: str) -> bool:
+    """True if new entries are allowed for LONG or SHORT."""
+    mode = normalize_trade_sides(params.trade_sides)
+    if mode == TRADE_SIDES_BOTH:
+        return True
+    if side == "LONG":
+        return mode == TRADE_SIDES_LONG
+    if side == "SHORT":
+        return mode == TRADE_SIDES_SHORT
+    raise ValueError(f"Unsupported side: {side}")
+
+
+def entry_legs_for_trade(params: FibbParams) -> tuple:
+    """Leg tuples enabled for entry under current trade_sides setting."""
+    import fibb_trading.core.fibb_config as cfg
+
+    legs = []
+    if side_entry_allowed(params, "SHORT"):
+        legs.extend(cfg.SHORT_LEGS)
+    if side_entry_allowed(params, "LONG"):
+        legs.extend(cfg.LONG_LEGS)
+    return tuple(legs)
 
 
 TP_MODE_FIXED_PCT = 0
@@ -111,6 +178,16 @@ def channel_tp_target_band(entry_id: str, side: str, channel_tp_offset: int) -> 
             f"entry_idx={idx} step={step} channel_tp_offset={channel_tp_offset}"
         )
     return CHANNEL_LADDER[tp_idx]
+
+# 進場須從「內側上一道通道」抵達（價格階梯：bott3…top3，越靠外越極端）
+ENTRY_APPROACH_FROM: dict[str, str] = {
+    "T1 Short": "basis",
+    "T2 Short": "top1",
+    "T3 Short": "top2",
+    "B1 Long": "basis",
+    "B2 Long": "bott1",
+    "B3 Long": "bott2",
+}
 
 # 內層 leg 觸及外層軌時，於內層通道價啟用止損（entry_id -> (outer_band, inner_band)）
 DEFERRED_CHANNEL_SL: dict[str, tuple[str, str]] = {

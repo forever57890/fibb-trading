@@ -18,9 +18,11 @@
 //    Python 可選 initial_capital + leverage 縮單；TV 固定口數時若資金不足會由 TV 自動減量，與 Python 仍可能略有差異。
 //
 // 4) 本腳本邏輯（與 run_fibb_backtest 相同順序）
-//    每根：先依 high/low 檢查平倉 → 再進場 → 再為 T2/B2 啟用延遲通道止損。
-//    止盈：進場價 ± Take Profit %（固定，不隨通道漂移；對應 Python use_channel_tp=false）。
-//    若你要對齊 Python「通道止盈」，請用回測 CLI 的 --channel-tp；本 Pine 目前未實作該模式。
+//    每根：先依 high/low 檢查 TP/通道止損 → 持倉逾 Max hold hours 則收盤強平(TimeStop)
+//         → 再進場 → 再為 T2/B2 啟用延遲通道止損。
+//    止盈：進場價 ± Take Profit %（固定，不隨通道漂移；對應 Python FIBB_TP_MODE=0）。
+//    持倉逾時：對應 Python FIBB_MAX_HOLDING_HOURS（預設 24，0=關閉）。
+//    若你要對齊 Python「通道止盈」，請用回測 CLI 的 FIBB_TP_MODE=2/3；本 Pine 目前未實作該模式。
 //
 //@version=5
 strategy(
@@ -50,6 +52,10 @@ qtyT1 = input.float(1.0, "T1 / B1 qty (BTC)", minval = 0.0001, step = 0.1)
 qtyT2 = input.float(2.0, "T2 / B2 qty (BTC)", minval = 0.0001, step = 0.1)
 qtyT3 = input.float(3.0, "T3 / B3 qty (BTC)", minval = 0.0001, step = 0.1)
 
+// 對應 Python FIBB_MAX_HOLDING_HOURS；0 = 關閉。逾時以當根收盤價平倉（process_orders_on_close）
+maxHoldHours = input.float(24.0, "Max hold hours (0=off)", minval = 0.0, step = 1.0)
+msPerHour    = 3600000.0
+
 showBands = input.bool(true, "Plot FiBB bands")
 
 // === Channels (Wilder ATR = ta.atr) ===
@@ -62,12 +68,31 @@ bott1 = basis - fibratio1 * avg
 bott2 = basis - fibratio2 * avg
 bott3 = basis - fibratio3 * avg
 
-// 由內向外穿越（與 Python _touch_short / _touch_long 一致）
-touchShort(float level) =>
+// 穿越通道（與 Python _cross_short / _cross_long）
+crossShort(float level) =>
     high >= level and high[1] < level[1]
 
-touchLong(float level) =>
+crossLong(float level) =>
     low <= level and low[1] > level[1]
+
+// 須從內側上一道通道抵達（與 Python ENTRY_APPROACH_FROM）
+touchShortT1() =>
+    crossShort(top1) and high[1] <= basis[1]
+
+touchShortT2() =>
+    crossShort(top2) and high[1] >= top1[1] and high[1] < top2[1]
+
+touchShortT3() =>
+    crossShort(top3) and high[1] >= top2[1] and high[1] < top3[1]
+
+touchLongB1() =>
+    crossLong(bott1) and low[1] >= basis[1]
+
+touchLongB2() =>
+    crossLong(bott2) and low[1] >= bott1[1] and low[1] > bott2[1]
+
+touchLongB3() =>
+    crossLong(bott3) and low[1] >= bott2[1] and low[1] > bott3[1]
 
 // === 依 entry_id 查持倉 ===
 openQty(string entryId) =>
@@ -86,6 +111,28 @@ openEntryPrice(string entryId) =>
                 p := strategy.opentrades.entry_price(i)
                 break
     p
+
+openEntryTime(string entryId) =>
+    int t = na
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(i) == entryId
+                t := strategy.opentrades.entry_time(i)
+                break
+    t
+
+// 持倉逾時（與 Python leg_hold_expired / try_time_stop_exit）
+legHoldExpired(string entryId) =>
+    bool expired = false
+    if maxHoldHours > 0 and openQty(entryId) > 0
+        int entryMs = openEntryTime(entryId)
+        if not na(entryMs)
+            expired := time - entryMs >= maxHoldHours * msPerHour
+    expired
+
+manageTimeStop(string entryId) =>
+    if legHoldExpired(entryId)
+        strategy.close(entryId, comment = "TimeStop")
 
 // T2/B2 延遲通道止損狀態（觸 T3/B3 當根鎖定 top2/bott2）
 var float t2ChannelSl = na
@@ -129,29 +176,37 @@ manageLongExit("B1 Long", false, na, false)
 manageLongExit("B2 Long", true, b2ChannelSl, b2SlArmed)
 manageLongExit("B3 Long", false, na, false)
 
+// 持倉逾時強平（僅在當根未觸 TP/通道止損時；收盤價平倉）
+manageTimeStop("T1 Short")
+manageTimeStop("T2 Short")
+manageTimeStop("T3 Short")
+manageTimeStop("B1 Long")
+manageTimeStop("B2 Long")
+manageTimeStop("B3 Long")
+
 // === 進場（僅回測區間內、收盤、最多 6 leg）===
 canEnter = strategy.opentrades < 6
 
 if inDateRange and canEnter
-    if touchShort(top1) and openQty("T1 Short") == 0
+    if touchShortT1() and openQty("T1 Short") == 0
         strategy.entry("T1 Short", strategy.short, qty = qtyT1)
-    if touchShort(top2) and openQty("T2 Short") == 0
+    if touchShortT2() and openQty("T2 Short") == 0
         strategy.entry("T2 Short", strategy.short, qty = qtyT2)
-    if touchShort(top3) and openQty("T3 Short") == 0
+    if touchShortT3() and openQty("T3 Short") == 0
         strategy.entry("T3 Short", strategy.short, qty = qtyT3)
-    if touchLong(bott1) and openQty("B1 Long") == 0
+    if touchLongB1() and openQty("B1 Long") == 0
         strategy.entry("B1 Long", strategy.long, qty = qtyT1)
-    if touchLong(bott2) and openQty("B2 Long") == 0
+    if touchLongB2() and openQty("B2 Long") == 0
         strategy.entry("B2 Long", strategy.long, qty = qtyT2)
-    if touchLong(bott3) and openQty("B3 Long") == 0
+    if touchLongB3() and openQty("B3 Long") == 0
         strategy.entry("B3 Long", strategy.long, qty = qtyT3)
 
 // 進場之後才啟用延遲止損（與 Python arm_deferred_channel_stops 順序一致）
-if openQty("T2 Short") > 0 and not t2SlArmed and touchShort(top3)
+if openQty("T2 Short") > 0 and not t2SlArmed and touchShortT3()
     t2ChannelSl := top2
     t2SlArmed   := true
 
-if openQty("B2 Long") > 0 and not b2SlArmed and touchLong(bott3)
+if openQty("B2 Long") > 0 and not b2SlArmed and touchLongB3()
     b2ChannelSl := bott2
     b2SlArmed   := true
 

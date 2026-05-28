@@ -10,11 +10,17 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from fibb_trading.backtest.backtest_io import ensure_test_data_dir
-from fibb_trading.core.data_fetch import fetch_binance_futures_klines, interval_to_ms, parse_time
+from fibb_trading.core.data_fetch import (
+    fetch_binance_futures_klines,
+    interval_to_minutes,
+    interval_to_ms,
+    parse_time,
+)
 from fibb_trading.core.fibb_config import (
     FibbParams,
     normalize_channel_tp_offset,
     normalize_tp_mode,
+    normalize_trade_sides,
 )
 from fibb_trading.core.fibb_env import configure_strategy_from_env, indicator_history_bars
 from fibb_trading.env_loader import load_fibb_env
@@ -30,7 +36,7 @@ INTERVAL = "15m"
 _BACKTEST_ROOT = Path(__file__).resolve().parent
 
 # 與先前延遲止損回測一致（約 2026-02-24～2026-05-26，本機時區）
-DEFAULT_START = "2025-01-01 00:00:00"
+DEFAULT_START = "2025-05-26 00:00:00"
 DEFAULT_END = "2026-05-26 23:59:59"
 
 
@@ -85,6 +91,30 @@ def plot_results(klines: pd.DataFrame, trades: pd.DataFrame, out_dir: Path) -> l
     plt.close(fig)
     outputs.append(p2)
     return outputs
+
+
+def summarize_trades_by_regime(
+    trades: pd.DataFrame, *, bar_minutes: int = 15
+) -> dict:
+    if trades.empty or "regime_is_high_vol" not in trades.columns:
+        return {}
+    out = {}
+    groups = {
+        "high_vol": trades[trades["regime_is_high_vol"] == True],  # noqa: E712
+        "non_high_vol": trades[trades["regime_is_high_vol"] == False],  # noqa: E712
+    }
+    for key, df_g in groups.items():
+        s = summarize_trades(df_g, bar_minutes=bar_minutes)
+        out[key] = {
+            "total_trades": s["total_trades"],
+            "win_rate": s["win_rate"],
+            "profit_factor": s["profit_factor"],
+            "max_drawdown": s["max_drawdown"],
+            "net_profit": s["net_profit"],
+            "time_stop_hits": s.get("time_stop_hits", 0),
+            "avg_holding_minutes": s["avg_holding_minutes"],
+        }
+    return out
 
 
 def parse_args(argv=None):
@@ -150,6 +180,56 @@ def parse_args(argv=None):
         default=env_p.leverage,
         help="Max notional = equity × leverage (match TV strategy properties)",
     )
+    p.add_argument(
+        "--max-holding-hours",
+        type=float,
+        default=env_p.max_holding_hours,
+        help="Force close after N hours at bar close (0=off, env FIBB_MAX_HOLDING_HOURS)",
+    )
+    p.add_argument(
+        "--regime-enabled",
+        type=int,
+        choices=[0, 1],
+        default=1 if env_p.regime_enabled else 0,
+        help="Enable 4H volatility regime controls (0/1)",
+    )
+    p.add_argument(
+        "--regime-h4-lookback",
+        type=int,
+        default=env_p.regime_h4_lookback,
+        help="4H range percentile lookback bars",
+    )
+    p.add_argument(
+        "--regime-h4-high-vol-quantile",
+        type=float,
+        default=env_p.regime_h4_high_vol_quantile,
+        help="High-vol threshold quantile (0~1)",
+    )
+    p.add_argument(
+        "--regime-high-vol-tp-mult",
+        type=float,
+        default=env_p.regime_high_vol_tp_mult,
+        help="TP pct multiplier under high volatility",
+    )
+    p.add_argument(
+        "--regime-high-vol-max-holding-hours",
+        type=float,
+        default=env_p.regime_high_vol_max_holding_hours,
+        help="Max hold hours under high volatility (0=keep base max hold)",
+    )
+    p.add_argument(
+        "--regime-block-outer-countertrend",
+        type=int,
+        choices=[0, 1],
+        default=1 if env_p.regime_block_outer_countertrend else 0,
+        help="Under high volatility, block countertrend outer legs (T3/B3)",
+    )
+    p.add_argument(
+        "--trade-sides",
+        choices=["both", "long", "short"],
+        default=env_p.trade_sides,
+        help="Allowed entry directions: both, long only, or short only",
+    )
     p.add_argument("--output-dir", default=None)
     return p.parse_args(argv)
 
@@ -179,6 +259,13 @@ def main(
     )
     end_ms = int(end_ts.timestamp() * 1000)
 
+    print(
+        f"Params: length={params.length} tp_mode={params.tp_mode} "
+        f"deferred_sl={params.use_deferred_channel_sl} "
+        f"max_holding_hours={params.max_holding_hours} "
+        f"regime_enabled={params.regime_enabled} "
+        f"trade_sides={params.trade_sides}"
+    )
     print(f"Fetching {symbol} {interval} klines: {fetch_start_ms} -> {end_ms}")
     klines = fetch_binance_futures_klines(symbol, interval, fetch_start_ms, end_ms)
     klines.to_json(
@@ -189,7 +276,9 @@ def main(
     )
 
     trades = run_fibb_backtest(klines, start_ts, end_ts, params)
-    summary = summarize_trades(trades)
+    bar_minutes = interval_to_minutes(interval)
+    summary = summarize_trades(trades, bar_minutes=bar_minutes)
+    regime_summary = summarize_trades_by_regime(trades, bar_minutes=bar_minutes)
 
     trades.to_json(
         test_data_dir / "trade_details.json",
@@ -199,6 +288,10 @@ def main(
     )
     (test_data_dir / "summary.json").write_text(
         json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    (test_data_dir / "regime_summary.json").write_text(
+        json.dumps(regime_summary, indent=2),
         encoding="utf-8",
     )
     leg_summary(trades).to_json(
@@ -214,11 +307,40 @@ def main(
     print("Saved:")
     print(test_data_dir / "trade_details.json")
     print(test_data_dir / "summary.json")
+    print(test_data_dir / "regime_summary.json")
     print(test_data_dir / "leg_summary.json")
     for c in charts:
         print(c)
     print("\nSummary:")
     print(json.dumps(summary, indent=2))
+    if summary.get("total_trades", 0) > 0:
+        print("\n持倉與浮虧:")
+        print(
+            f"  平均持倉: {summary['avg_holding_bars']:.2f} 根 K "
+            f"({summary['avg_holding_minutes']:.0f} 分鐘)"
+        )
+        print(
+            f"  最長持倉: {summary['max_holding_bars']} 根 K "
+            f"({summary['max_holding_minutes']} 分鐘)"
+        )
+        print(
+            f"  單筆最大未平倉毛虧損: {summary['max_unrealized_loss']:.4f} USDT "
+            f"(各筆持倉期間最差，平均 {summary['avg_max_unrealized_loss']:.4f})"
+        )
+        print(
+            f"  組合最大未平倉毛虧損: {summary['portfolio_max_unrealized_loss']:.4f} USDT "
+            f"(同時持倉合計最不利)"
+        )
+        if summary.get("time_stop_hits") is not None:
+            print(f"  持倉逾時平倉 (TIME_STOP): {summary['time_stop_hits']} 筆")
+    if regime_summary:
+        print("\nRegime 分組成效:")
+        for key, s in regime_summary.items():
+            print(
+                f"  {key}: trades={s['total_trades']} win_rate={s['win_rate']} "
+                f"pf={s['profit_factor']} mdd={s['max_drawdown']} "
+                f"time_stop={s['time_stop_hits']}"
+            )
 
 
 def _resolve_cli_tp_mode(cli, env_p: FibbParams) -> int:
@@ -252,6 +374,14 @@ if __name__ == "__main__":
             if cli.channel_tp_offset is not None
             else env_p.channel_tp_offset
         ),
+        max_holding_hours=cli.max_holding_hours,
+        regime_enabled=bool(cli.regime_enabled),
+        regime_h4_lookback=cli.regime_h4_lookback,
+        regime_h4_high_vol_quantile=cli.regime_h4_high_vol_quantile,
+        regime_high_vol_tp_mult=cli.regime_high_vol_tp_mult,
+        regime_high_vol_max_holding_hours=cli.regime_high_vol_max_holding_hours,
+        regime_block_outer_countertrend=bool(cli.regime_block_outer_countertrend),
+        trade_sides=normalize_trade_sides(cli.trade_sides),
     )
     main(
         start=cli.start,

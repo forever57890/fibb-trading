@@ -27,14 +27,17 @@ from fibb_trading.core.fibb_logic import (
     refresh_reprice_tp_to_basis,
     resolve_entry_qty,
     resolve_entry_take_profit,
+    resolve_regime_controls,
+    should_block_entry_by_regime,
     take_profit_price_pct,
     try_exit_leg,
+    try_time_stop_exit,
     uses_deferred_channel_sl,
 )
 from fibb_trading.trade.exchange import (
     BinanceFuturesTrader,
     cancel_leg_tp,
-    market_close_leg_qty,
+    close_leg_with_ioc,
     open_leg_with_tp,
     replace_leg_tp,
 )
@@ -94,6 +97,44 @@ def _sync_exchange_take_profits(
                 "take_profit_price": new_tp,
             }
         log["tp_reprices"].append(reprice_log)
+
+
+def _execute_leg_exit(
+    *,
+    entry_id: str,
+    leg: OpenLeg,
+    ts: pd.Timestamp,
+    exit_price: float,
+    reason: str,
+    state: LiveState,
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    dry_run: bool,
+    fee_rate: float,
+    log: Dict[str, Any],
+    open_legs: Dict[str, OpenLeg],
+) -> None:
+    exec_result: Dict[str, Any] = {
+        "entry_id": entry_id,
+        "reason": reason,
+        "exit_price": exit_price,
+    }
+
+    tp_algo_id = get_tp_algo_id(state, entry_id)
+    if trader is not None and tp_algo_id is not None:
+        exec_result["cancel_tp"] = cancel_leg_tp(trader, symbol, tp_algo_id)
+
+    if trader is not None:
+        exec_result["exchange"] = close_leg_with_ioc(
+            trader, symbol, leg.side, leg.qty, dry_run=dry_run
+        )
+    elif dry_run:
+        exec_result["exchange"] = {"status": "DRY_RUN_CLOSE"}
+
+    closed = _closed_stub(leg, ts, exit_price, reason, fee_rate)
+    append_closed_trade(state, closed)
+    log["exits"].append({**exec_result, "trade": closed})
+    del open_legs[entry_id]
 
 
 def _closed_stub(leg: OpenLeg, ts: pd.Timestamp, exit_price: float, reason: str, fee_rate: float) -> dict:
@@ -170,6 +211,7 @@ def process_bar(
     bar_high = float(curr["high"])
     bar_low = float(curr["low"])
     close_price = float(curr["close"])
+    controls = resolve_regime_controls(curr, params)
 
     log: Dict[str, Any] = {
         "bar_time": ts_iso,
@@ -179,6 +221,8 @@ def process_bar(
         "armed_stops": [],
         "tp_reprices": [],
         "hold_diagnostics": [],
+        "regime": controls,
+        "trade_sides": params.trade_sides,
     }
 
     if trader is not None and not dry_run:
@@ -208,31 +252,30 @@ def process_bar(
         old_channel_tps = {eid: leg.take_profit_price for eid, leg in open_legs.items()}
         refresh_channel_take_profits(open_legs, curr, params)
 
-    # --- exits ---
+    # --- exits (intrabar TP/SL, then bar-close time stop) ---
     for entry_id in list(open_legs.keys()):
         leg = open_legs[entry_id]
         exit_price, reason = try_exit_leg(leg, bar_high, bar_low)
         if exit_price is None:
-            continue
-
-        exec_result: Dict[str, Any] = {"entry_id": entry_id, "reason": reason, "exit_price": exit_price}
-
-        # Cancel the TP algo order before market-closing the leg
-        tp_algo_id = get_tp_algo_id(state, entry_id)
-        if trader is not None and tp_algo_id is not None:
-            exec_result["cancel_tp"] = cancel_leg_tp(trader, symbol, tp_algo_id)
-
-        if trader is not None:
-            exec_result["exchange"] = market_close_leg_qty(
-                trader, symbol, leg.side, leg.qty, dry_run=dry_run
+            exit_price, reason = try_time_stop_exit(
+                leg, ts, close_price, controls["max_holding_hours"]
             )
-        elif dry_run:
-            exec_result["exchange"] = {"status": "DRY_RUN_CLOSE"}
-
-        closed = _closed_stub(leg, ts, exit_price, reason, params.fee_rate)
-        append_closed_trade(state, closed)
-        log["exits"].append({**exec_result, "trade": closed})
-        del open_legs[entry_id]
+        if exit_price is None:
+            continue
+        _execute_leg_exit(
+            entry_id=entry_id,
+            leg=leg,
+            ts=ts,
+            exit_price=exit_price,
+            reason=reason,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            fee_rate=params.fee_rate,
+            log=log,
+            open_legs=open_legs,
+        )
 
     tp_algo_ids_updates: Dict[str, Any] = {}
     log["tp_mode"] = params.tp_mode
@@ -272,7 +315,9 @@ def process_bar(
         log["hold_diagnostics"].append(analyze_open_leg_exits(leg, bar_high, bar_low))
 
     # --- entries (live: no backtest end-date gate) ---
-    entry_diagnostics = analyze_entry_legs(curr, prev, set(open_legs.keys()))
+    entry_diagnostics = analyze_entry_legs(
+        curr, prev, set(open_legs.keys()), params
+    )
     diag_by_id = {d["entry_id"]: d for d in entry_diagnostics}
     if params.initial_capital <= 0 or params.leverage <= 0:
         equity = float(wallet_equity or 1e12)
@@ -284,7 +329,7 @@ def process_bar(
     new_tp_algo_ids: Dict[str, Any] = {}
 
     if len(open_legs) < params.max_open_legs:
-        signals = detect_entry_signals(curr, prev, set(open_legs.keys()))
+        signals = detect_entry_signals(curr, prev, set(open_legs.keys()), params)
         for entry_id, side, qty, band in signals:
             if len(open_legs) >= params.max_open_legs:
                 if entry_id in diag_by_id:
@@ -303,9 +348,28 @@ def process_bar(
                     {"entry_id": entry_id, "skipped": True, "reason": reason}
                 )
                 continue
+            blocked, block_reason = should_block_entry_by_regime(
+                entry_id, side, curr, params
+            )
+            if blocked:
+                if entry_id in diag_by_id:
+                    diag_by_id[entry_id]["blocked_reason"] = block_reason
+                log["entries"].append(
+                    {
+                        "entry_id": entry_id,
+                        "skipped": True,
+                        "reason": block_reason,
+                    }
+                )
+                continue
 
             entry_tp, tp_band = resolve_entry_take_profit(
-                entry_id, side, close_price, curr, params
+                entry_id,
+                side,
+                close_price,
+                curr,
+                params,
+                tp_pct_override=controls["tp_pct"],
             )
             channel_tp_at_open = entry_tp if tp_mode_uses_channel(params) else None
             if uses_deferred_channel_sl(entry_id, params):
@@ -327,7 +391,7 @@ def process_bar(
                     symbol,
                     side,
                     qty,
-                    params.tp_pct,
+                    controls["tp_pct"],
                     signal_close=close_price,
                     take_profit_price=channel_tp_at_open,
                     dry_run=dry_run,
@@ -352,8 +416,15 @@ def process_bar(
                 exec_result["tp_algo_id"] = None
 
             if tp is None:
-                tp = entry_tp if tp_mode_uses_channel(params) else take_profit_price_pct(
-                    side, fill_entry, params
+                tp = (
+                    entry_tp
+                    if tp_mode_uses_channel(params)
+                    else take_profit_price_pct(
+                        side,
+                        fill_entry,
+                        params,
+                        tp_pct_override=controls["tp_pct"],
+                    )
                 )
 
             open_legs[entry_id] = OpenLeg(

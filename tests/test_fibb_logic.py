@@ -3,22 +3,32 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from fibb_trading.core.fibb_config import FibbParams
+from fibb_trading.core.fibb_config import (
+    FibbParams,
+    entry_legs_for_trade,
+    side_entry_allowed,
+)
 from fibb_trading.core.fibb_logic import (
+    OpenLeg,
     arm_deferred_channel_stops,
     bracket_prices,
     compute_fibb_channels,
     compute_rma,
     compute_true_range,
-    resolve_entry_qty,
+    detect_entry_signals,
+    leg_hold_expired,
+    leg_unrealized_gross_at_extreme,
+    mark_open_legs_unrealized,
     refresh_channel_take_profits,
     refresh_reprice_tp_to_basis,
+    resolve_entry_qty,
     resolve_take_profit,
     run_fibb_backtest,
+    summarize_trades,
     take_profit_price_pct,
     try_exit_leg,
+    try_time_stop_exit,
     uses_deferred_channel_sl,
-    OpenLeg,
 )
 
 
@@ -117,6 +127,76 @@ class TestFibbLogic(unittest.TestCase):
         )
         self.assertAlmostEqual(leg.take_profit_price, 99.0)
 
+    def test_entry_short_requires_approach_from_prev_channel(self):
+        from fibb_trading.core.fibb_logic import _touch_short
+
+        curr = pd.Series({"high": 106.0, "top1": 101.0, "top2": 105.0, "basis": 100.0})
+        # 僅穿越 top2，前一根已在 top2 區徘徊（未從 top1 來）
+        prev_wander = pd.Series(
+            {"high": 105.0, "top1": 100.0, "top2": 104.0, "basis": 99.0}
+        )
+        self.assertFalse(_touch_short(curr, prev_wander, "top2", "T2 Short"))
+        # 自 top1 區抵達並穿越 top2
+        prev_from_top1 = pd.Series(
+            {"high": 101.0, "top1": 100.0, "top2": 104.0, "basis": 99.0}
+        )
+        self.assertTrue(_touch_short(curr, prev_from_top1, "top2", "T2 Short"))
+
+    def test_trade_sides_filters_entry_signals(self):
+        curr = pd.Series(
+            {
+                "high": 106.0,
+                "low": 79.0,
+                "top1": 101.0,
+                "top2": 105.0,
+                "top3": 110.0,
+                "bott1": 90.0,
+                "bott2": 85.0,
+                "bott3": 80.0,
+                "basis": 100.0,
+            }
+        )
+        prev = pd.Series(
+            {
+                "high": 100.0,
+                "low": 90.0,
+                "top1": 100.0,
+                "top2": 104.0,
+                "top3": 109.0,
+                "bott1": 90.0,
+                "bott2": 85.0,
+                "bott3": 79.5,
+                "basis": 99.0,
+            }
+        )
+        open_ids: set = set()
+
+        short_only = FibbParams(trade_sides="short")
+        long_only = FibbParams(trade_sides="long")
+        self.assertTrue(side_entry_allowed(short_only, "SHORT"))
+        self.assertFalse(side_entry_allowed(short_only, "LONG"))
+        self.assertEqual(len(entry_legs_for_trade(short_only)), 3)
+        self.assertEqual(len(entry_legs_for_trade(long_only)), 3)
+
+        short_signals = detect_entry_signals(curr, prev, open_ids, short_only)
+        long_signals = detect_entry_signals(curr, prev, open_ids, long_only)
+        self.assertTrue(all(s[1] == "SHORT" for s in short_signals))
+        self.assertTrue(all(s[1] == "LONG" for s in long_signals))
+
+    def test_entry_long_requires_approach_from_prev_channel(self):
+        from fibb_trading.core.fibb_logic import _touch_long
+
+        curr = pd.Series({"low": 79.0, "bott2": 85.0, "bott3": 80.0, "bott1": 90.0})
+        # 前一根已在 bott3 之下，僅算穿越但非自 bott2 抵達
+        prev_already_below = pd.Series(
+            {"low": 78.0, "bott1": 90.0, "bott2": 85.0, "bott3": 80.0}
+        )
+        self.assertFalse(_touch_long(curr, prev_already_below, "bott3", "B3 Long"))
+        prev_from_bott2 = pd.Series(
+            {"low": 86.0, "bott1": 90.0, "bott2": 85.0, "bott3": 79.5}
+        )
+        self.assertTrue(_touch_long(curr, prev_from_bott2, "bott3", "B3 Long"))
+
     def test_channel_tp_two_gap_offset(self):
         from fibb_trading.core.fibb_config import channel_tp_target_band
 
@@ -127,6 +207,47 @@ class TestFibbLogic(unittest.TestCase):
         self.assertEqual(channel_tp_target_band("T1 Short", "SHORT", off), "bott1")
         self.assertEqual(channel_tp_target_band("B2 Long", "LONG", off), "basis")
         self.assertEqual(channel_tp_target_band("T2 Short", "SHORT", off), "basis")
+
+    def test_mark_open_legs_unrealized_tracks_worst(self):
+        leg = OpenLeg(
+            entry_id="B1 Long",
+            side="LONG",
+            qty=1.0,
+            entry_time=pd.Timestamp("2024-06-01", tz="UTC"),
+            entry_price=100.0,
+            take_profit_price=110.0,
+            stop_loss_price=None,
+            band="bott1",
+        )
+        open_legs = {"B1 Long": leg}
+        mark_open_legs_unrealized(open_legs, bar_low=95.0, bar_high=102.0)
+        self.assertAlmostEqual(leg.worst_unrealized_gross, -5.0)
+        total = mark_open_legs_unrealized(open_legs, bar_low=98.0, bar_high=101.0)
+        self.assertAlmostEqual(leg.worst_unrealized_gross, -5.0)
+        self.assertAlmostEqual(total, -2.0)
+
+    def test_summarize_trades_holding_and_unrealized(self):
+        trades = pd.DataFrame(
+            {
+                "gross_pnl": [10.0, -3.0],
+                "net_pnl": [9.0, -4.0],
+                "win": [True, False],
+                "take_profit_hit": [True, False],
+                "stop_loss_hit": [False, True],
+                "holding_bars": [4, 20],
+                "max_unrealized_gross": [-5.0, -12.0],
+            }
+        )
+        trades["drawdown"] = [0.0, -4.0]
+        trades.attrs["portfolio_max_unrealized_gross"] = -18.0
+        summary = summarize_trades(trades, bar_minutes=15)
+        self.assertEqual(summary["avg_holding_bars"], 12.0)
+        self.assertEqual(summary["max_holding_bars"], 20)
+        self.assertEqual(summary["avg_holding_minutes"], 180.0)
+        self.assertEqual(summary["max_holding_minutes"], 300)
+        self.assertAlmostEqual(summary["avg_max_unrealized_loss"], -8.5)
+        self.assertAlmostEqual(summary["max_unrealized_loss"], -12.0)
+        self.assertAlmostEqual(summary["portfolio_max_unrealized_loss"], -18.0)
 
     def test_channel_tp_offset_from_params(self):
         params = FibbParams(tp_mode=3, channel_tp_offset=1)
@@ -300,7 +421,7 @@ class TestFibbLogic(unittest.TestCase):
         entry_bar = ts[3]
         end_bar = ts[3]
 
-        def fake_signals(curr, _prev, open_ids):
+        def fake_signals(curr, _prev, open_ids, _params=None):
             if curr["open_time"] == entry_bar and "B1 Long" not in open_ids:
                 return [("B1 Long", "LONG", 1.0, "bott1")]
             return []
@@ -320,6 +441,64 @@ class TestFibbLogic(unittest.TestCase):
             end="2024-06-01 12:00",
         )
         self.assertIsInstance(trades, pd.DataFrame)
+
+    def test_leg_hold_expired_and_time_stop_exit(self):
+        entry_time = self._ts("2024-06-01 00:00")
+        leg = OpenLeg(
+            entry_id="B1 Long",
+            side="LONG",
+            qty=1.0,
+            entry_time=entry_time,
+            entry_price=100.0,
+            take_profit_price=200.0,
+            stop_loss_price=None,
+            band="bott1",
+        )
+        self.assertFalse(
+            leg_hold_expired(leg, self._ts("2024-06-01 23:00"), max_holding_hours=24.0)
+        )
+        self.assertTrue(
+            leg_hold_expired(leg, self._ts("2024-06-02 00:00"), max_holding_hours=24.0)
+        )
+        self.assertFalse(leg_hold_expired(leg, self._ts("2024-06-02 00:00"), 0.0))
+        price, reason = try_time_stop_exit(
+            leg, self._ts("2024-06-02 00:00"), 101.5, max_holding_hours=24.0
+        )
+        self.assertEqual(reason, "TIME_STOP")
+        self.assertEqual(price, 101.5)
+
+    def test_backtest_time_stop_after_max_hold(self):
+        ts = pd.date_range("2024-06-01", periods=10, freq="15min", tz="UTC")
+        klines = pd.DataFrame(
+            {
+                "open_time": ts,
+                "open": [100.0] * 10,
+                "high": [100.0] * 10,
+                "low": [100.0] * 10,
+                "close": [100.0] * 10,
+                "volume": 1.0,
+            }
+        )
+        entry_bar = ts[3]
+
+        def fake_signals(curr, _prev, open_ids, _params=None):
+            if curr["open_time"] == entry_bar and "B1 Long" not in open_ids:
+                return [("B1 Long", "LONG", 1.0, "bott1")]
+            return []
+
+        params = FibbParams(
+            length=2,
+            tp_pct=0.5,
+            sl_pct=0.5,
+            max_holding_hours=0.25,
+        )
+        with patch(
+            "fibb_trading.core.fibb_logic.detect_entry_signals", side_effect=fake_signals
+        ):
+            trades = run_fibb_backtest(klines, ts[0], ts[-1], params)
+        self.assertFalse(trades.empty)
+        self.assertEqual(trades["exit_reason"].iloc[0], "TIME_STOP")
+        self.assertTrue(trades["time_stop_hit"].iloc[0])
 
 
 if __name__ == "__main__":

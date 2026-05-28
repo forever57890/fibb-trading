@@ -20,7 +20,9 @@ from fibb_trading.core.fibb_config import (
     TP_MODE_FIXED_PCT,
     normalize_channel_tp_offset,
     normalize_tp_mode,
+    normalize_trade_sides,
     tp_mode_label,
+    trade_sides_label,
 )
 from fibb_trading.env_loader import load_fibb_env
 
@@ -87,6 +89,26 @@ def load_fibb_params_from_env(*, reload_env: bool = True) -> FibbParams:
         tp_mode=_load_tp_mode_from_env(d.tp_mode),
         channel_tp_offset=normalize_channel_tp_offset(
             _env_int("FIBB_CHANNEL_TP_OFFSET", d.channel_tp_offset)
+        ),
+        max_holding_hours=_env_float("FIBB_MAX_HOLDING_HOURS", d.max_holding_hours),
+        regime_enabled=_env_bool("FIBB_REGIME_ENABLED", d.regime_enabled),
+        regime_h4_lookback=_env_int("FIBB_REGIME_H4_LOOKBACK", d.regime_h4_lookback),
+        regime_h4_high_vol_quantile=_env_float(
+            "FIBB_REGIME_H4_HIGH_VOL_QUANTILE", d.regime_h4_high_vol_quantile
+        ),
+        regime_high_vol_tp_mult=_env_float(
+            "FIBB_REGIME_HIGH_VOL_TP_MULT", d.regime_high_vol_tp_mult
+        ),
+        regime_high_vol_max_holding_hours=_env_float(
+            "FIBB_REGIME_HIGH_VOL_MAX_HOLDING_HOURS",
+            d.regime_high_vol_max_holding_hours,
+        ),
+        regime_block_outer_countertrend=_env_bool(
+            "FIBB_REGIME_BLOCK_OUTER_COUNTERTREND",
+            d.regime_block_outer_countertrend,
+        ),
+        trade_sides=normalize_trade_sides(
+            os.getenv("FIBB_TRADE_SIDES", d.trade_sides)
         ),
     )
 
@@ -160,6 +182,15 @@ def params_snapshot_dict(params: FibbParams) -> Dict[str, Any]:
         "tp_mode": params.tp_mode,
         "tp_mode_label": tp_mode_label(params.tp_mode),
         "channel_tp_offset": params.channel_tp_offset,
+        "max_holding_hours": params.max_holding_hours,
+        "regime_enabled": params.regime_enabled,
+        "regime_h4_lookback": params.regime_h4_lookback,
+        "regime_h4_high_vol_quantile": params.regime_h4_high_vol_quantile,
+        "regime_high_vol_tp_mult": params.regime_high_vol_tp_mult,
+        "regime_high_vol_max_holding_hours": params.regime_high_vol_max_holding_hours,
+        "regime_block_outer_countertrend": params.regime_block_outer_countertrend,
+        "trade_sides": params.trade_sides,
+        "trade_sides_label": trade_sides_label(params.trade_sides),
         "qty_t1": cfg.SHORT_LEGS[0][2],
         "qty_t2": cfg.SHORT_LEGS[1][2],
         "qty_t3": cfg.SHORT_LEGS[2][2],

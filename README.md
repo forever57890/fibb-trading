@@ -28,7 +28,10 @@
 | low 穿越 B2 | LONG | 2 | B2 Long |
 | low 穿越 B3 | LONG | 3 | B3 Long |
 
-觸及定義（與 Pine 一致）：`high >= topX` 且 `high[1] < topX[1]`（做空）；`low <= bottX` 且 `low[1] > bottX[1]`（做多）。  
+觸及定義（與 Pine 一致）：
+1. **穿越**：`high >= 軌` 且 `high[1] < 軌[1]`（做空）；`low <= 軌` 且 `low[1] > 軌[1]`（做多）。
+2. **自內側上一道通道抵達**（前一根 K）：T1 自 `basis`；T2 自 `top1`；T3 自 `top2`；B1 自 `basis`；B2 自 `bott1`；B3 自 `bott2`。僅在通道間徘徊、未從內側點位來者不開倉。
+
 同一 `entry_id` 僅允許一筆未平倉（`isOpen`）。
 
 ### 出場（與目前 `FibbParams` 預設一致）
@@ -231,6 +234,8 @@ TZ=UTC
 | `trade_details.json` | 每筆平倉 leg |
 | `summary.json` | 淨利、勝率、profit factor、max drawdown |
 | `leg_summary.json` | 各 T1/T2/T3/B1/B2/B3 分組 |
+
+`summary.json` 另含持倉統計：**平均／最長持倉**（根 K 與分鐘）、**單筆最大未平倉毛虧損**（持倉期間最不利價格）、**組合最大未平倉毛虧損**（多 leg 同時持倉合計最不利；不含手續費）。
 | `equity_drawdown.png` | 權益與回撤 |
 | `fibb_channels_trades.png` | 通道與進場示意 |
 

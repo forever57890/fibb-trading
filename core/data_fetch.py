@@ -33,6 +33,11 @@ def interval_to_ms(interval: str) -> int:
     return INTERVAL_MS[key]
 
 
+def interval_to_minutes(interval: str) -> int:
+    """K 線週期字串轉分鐘數（例：15m -> 15）。"""
+    return interval_to_ms(interval) // 60_000
+
+
 def fetch_binance_futures_klines(
     symbol: str,
     interval: str,

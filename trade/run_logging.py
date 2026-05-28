@@ -222,6 +222,15 @@ def build_run_summary_lines(result: dict) -> List[str]:
             if p.get("tp_mode") in (2, 3)
             else ""
         )
+        + f" max_hold_h={p.get('max_holding_hours')}"
+        + f" trade_sides={p.get('trade_sides', 'both')}"
+        + (
+            f" regime=on(q={p.get('regime_h4_high_vol_quantile')} "
+            f"tp_mult={p.get('regime_high_vol_tp_mult')} "
+            f"hold_h={p.get('regime_high_vol_max_holding_hours')})"
+            if p.get("regime_enabled")
+            else " regime=off"
+        )
     )
 
     state_before = result.get("state_before") or {}

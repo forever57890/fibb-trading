@@ -2,7 +2,7 @@
 FiBB 通道策略邏輯（對應 Pine Script「FiBB 15m BTC Layer Strategy」）。
 
 通道：basis = SMA(close, len)，偏移 = ta.atr(len) × Fibonacci 倍率（Wilder RMA）。
-進場：價格由內向外穿越 T1/T2/T3 做空、B1/B2/B3 做多（每 leg 獨立持倉）。
+進場：價格由內側上一道通道抵達並穿越 T1/T2/T3 做空、B1/B2/B3 做多（每 leg 獨立持倉）。
 出場：預設全 leg 固定 % 止盈；T1/T3/B1/B3 無止損；T2/B2 觸 T3/B3 後以 T2/B2 通道價止損。
 止盈模式由 FibbParams.tp_mode 控制（0=固定 %，1=basis，2=通道隨 K，3=通道鎖定）。
 """
@@ -10,7 +10,7 @@ FiBB 通道策略邏輯（對應 Pine Script「FiBB 15m BTC Layer Strategy」）
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -18,10 +18,14 @@ from fibb_trading.core import fibb_config
 from fibb_trading.core.fibb_config import (
     CHANNEL_TP_ENTRY_INDEX,
     channel_tp_target_band,
+    entry_legs_for_trade,
+    side_entry_allowed,
     tp_mode_channel_tracks_bar,
     tp_mode_uses_channel,
+    trade_sides_label,
     DEFERRED_CHANNEL_SL,
     DEFAULT_PARAMS,
+    ENTRY_APPROACH_FROM,
     FibbParams,
 )
 
@@ -38,6 +42,8 @@ class OpenLeg:
     band: str
     take_profit_band: str = ""  # 通道止盈所跟隨的欄位（basis / top1 / …）
     sl_use_channel: bool = False  # True：止損價為 T2/B2 通道（回撤觸軌平倉）
+    entry_bar_index: int = 0
+    worst_unrealized_gross: float = 0.0  # 持倉期間最差毛浮盈虧（≤0 為浮虧）
 
 
 def compute_rma(series: pd.Series, length: int) -> pd.Series:
@@ -92,10 +98,53 @@ def compute_fibb_channels(df: pd.DataFrame, params: FibbParams = DEFAULT_PARAMS)
     out["bott1"] = basis - r1
     out["bott2"] = basis - r2
     out["bott3"] = basis - r3
+    _attach_h4_regime_columns(out, params)
     return out
 
 
-def _touch_short(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
+def _attach_h4_regime_columns(out: pd.DataFrame, params: FibbParams) -> None:
+    """Attach 4H volatility/trend regime features to 15m bars."""
+    if "open_time" not in out.columns or out.empty:
+        return
+    ohlc_cols = ("open", "high", "low", "close")
+    if any(c not in out.columns for c in ohlc_cols):
+        return
+
+    out["open_time"] = pd.to_datetime(out["open_time"], utc=True)
+    base = out[["open_time", "open", "high", "low", "close"]].copy()
+    base["open_time"] = pd.to_datetime(base["open_time"], utc=True)
+    base = base.sort_values("open_time").set_index("open_time")
+    h4 = (
+        base.resample("4h", label="left", closed="left")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+    if h4.empty:
+        return
+
+    h4["h4_range_pct"] = (h4["high"] - h4["low"]) / h4["close"]
+    h4["h4_range_pct"] = h4["h4_range_pct"].replace([float("inf"), float("-inf")], pd.NA)
+    h4["h4_basis"] = h4["close"].rolling(params.length, min_periods=params.length).mean()
+    h4["h4_basis_slope"] = h4["h4_basis"] - h4["h4_basis"].shift(1)
+    q = min(max(float(params.regime_h4_high_vol_quantile), 0.01), 0.99)
+    lookback = max(int(params.regime_h4_lookback), 5)
+    h4["h4_range_pct_q_high"] = h4["h4_range_pct"].rolling(
+        lookback, min_periods=min(lookback, 20)
+    ).quantile(q)
+
+    h4 = h4.reset_index()[["open_time", "h4_range_pct", "h4_basis_slope", "h4_range_pct_q_high"]]
+    merged = pd.merge_asof(
+        out.sort_values("open_time"),
+        h4.sort_values("open_time"),
+        on="open_time",
+        direction="backward",
+    )
+    out["h4_range_pct"] = merged["h4_range_pct"].to_numpy()
+    out["h4_basis_slope"] = merged["h4_basis_slope"].to_numpy()
+    out["h4_range_pct_q_high"] = merged["h4_range_pct_q_high"].to_numpy()
+
+
+def _cross_short(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
     level = curr[band_col]
     prev_level = prev[band_col]
     if pd.isna(level) or pd.isna(prev_level):
@@ -103,7 +152,7 @@ def _touch_short(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
     return float(curr["high"]) >= float(level) and float(prev["high"]) < float(prev_level)
 
 
-def _touch_long(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
+def _cross_long(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
     level = curr[band_col]
     prev_level = prev[band_col]
     if pd.isna(level) or pd.isna(prev_level):
@@ -111,14 +160,72 @@ def _touch_long(curr: pd.Series, prev: pd.Series, band_col: str) -> bool:
     return float(curr["low"]) <= float(level) and float(prev["low"]) > float(prev_level)
 
 
+def _came_from_prev_channel_short(
+    prev: pd.Series, entry_band: str, prev_band: str
+) -> bool:
+    """
+    前一根 K 的價格須處於「內側通道」區間，才視為從該點位抵達外軌。
+    T1：前一根 high 在 basis 以內（尚未進入 top1 區）。
+    T2/T3：前一根 high 已觸及內軌，但尚未觸及本軌。
+    """
+    prev_inner = prev.get(prev_band)
+    prev_entry = prev.get(entry_band)
+    if pd.isna(prev_inner) or pd.isna(prev_entry):
+        return False
+    prev_high = float(prev["high"])
+    prev_inner_f = float(prev_inner)
+    prev_entry_f = float(prev_entry)
+    if entry_band == "top1":
+        return prev_high <= prev_inner_f
+    return prev_high >= prev_inner_f and prev_high < prev_entry_f
+
+
+def _came_from_prev_channel_long(
+    prev: pd.Series, entry_band: str, prev_band: str
+) -> bool:
+    """
+    B1：前一根仍在 basis 之上（尚未進入 bott1 區）。
+    B2/B3：前一根 low 仍在內軌之上、且尚未觸及本軌（自內側往下穿越）。
+    """
+    prev_inner = prev.get(prev_band)
+    prev_entry = prev.get(entry_band)
+    if pd.isna(prev_inner) or pd.isna(prev_entry):
+        return False
+    prev_low = float(prev["low"])
+    prev_inner_f = float(prev_inner)
+    prev_entry_f = float(prev_entry)
+    if entry_band == "bott1":
+        return prev_low >= prev_inner_f
+    return prev_low >= prev_inner_f and prev_low > prev_entry_f
+
+
+def _touch_short(curr: pd.Series, prev: pd.Series, band_col: str, entry_id: str) -> bool:
+    if not _cross_short(curr, prev, band_col):
+        return False
+    prev_band = ENTRY_APPROACH_FROM.get(entry_id)
+    if prev_band is None:
+        return True
+    return _came_from_prev_channel_short(prev, band_col, prev_band)
+
+
+def _touch_long(curr: pd.Series, prev: pd.Series, band_col: str, entry_id: str) -> bool:
+    if not _cross_long(curr, prev, band_col):
+        return False
+    prev_band = ENTRY_APPROACH_FROM.get(entry_id)
+    if prev_band is None:
+        return True
+    return _came_from_prev_channel_long(prev, band_col, prev_band)
+
+
 def analyze_entry_legs(
     curr: pd.Series,
     prev: pd.Series,
     open_entry_ids: set,
+    params: FibbParams = DEFAULT_PARAMS,
 ) -> List[dict]:
     """
     每個 leg 在本根 K 的進場狀態（供實盤 log 解釋為何未開單）。
-    status: channels_not_ready | already_open | touch_signal | no_touch
+    status: channels_not_ready | already_open | touch_signal | no_touch | side_disabled
     """
     rows: List[dict] = []
     for entry_id, side, qty, band in fibb_config.ALL_LEGS:
@@ -130,6 +237,13 @@ def analyze_entry_legs(
             "band": band,
             "qty_btc": qty,
         }
+        if not side_entry_allowed(params, side):
+            row["status"] = "side_disabled"
+            row["reason"] = (
+                f"方向已關閉（trade_sides={trade_sides_label(params.trade_sides)}）"
+            )
+            rows.append(row)
+            continue
         if pd.isna(level) or pd.isna(prev_level):
             row["status"] = "channels_not_ready"
             row["reason"] = f"通道 {band} 尚未就緒（歷史 K 不足，無法計算 SMA/ATR）"
@@ -152,51 +266,91 @@ def analyze_entry_legs(
 
         level_f = float(level)
         prev_level_f = float(prev_level)
+        prev_band_col = ENTRY_APPROACH_FROM.get(entry_id, "")
+        prev_band_level = (
+            float(prev[prev_band_col])
+            if prev_band_col and pd.notna(prev.get(prev_band_col))
+            else None
+        )
         if side == "SHORT":
             high = float(curr["high"])
             prev_high = float(prev["high"])
-            crossed = high >= level_f and prev_high < prev_level_f
+            crossed = _cross_short(curr, prev, band)
+            from_prev = (
+                _came_from_prev_channel_short(prev, band, prev_band_col)
+                if prev_band_col
+                else True
+            )
+            touched = crossed and from_prev
             row["touch"] = {
-                "rule": "high >= band 且 high[1] < band[1]",
+                "rule": "穿越上軌且前一根自內側通道抵達",
                 "high": high,
                 "prev_high": prev_high,
                 "band": level_f,
                 "prev_band": prev_level_f,
+                "approach_from_band": prev_band_col,
+                "approach_from_level": prev_band_level,
                 "crossed": crossed,
+                "from_prev_channel": from_prev,
             }
         else:
             low = float(curr["low"])
             prev_low = float(prev["low"])
-            crossed = low <= level_f and prev_low > prev_level_f
+            crossed = _cross_long(curr, prev, band)
+            from_prev = (
+                _came_from_prev_channel_long(prev, band, prev_band_col)
+                if prev_band_col
+                else True
+            )
+            touched = crossed and from_prev
             row["touch"] = {
-                "rule": "low <= band 且 low[1] > band[1]",
+                "rule": "穿越下軌且前一根自內側通道抵達",
                 "low": low,
                 "prev_low": prev_low,
                 "band": level_f,
                 "prev_band": prev_level_f,
+                "approach_from_band": prev_band_col,
+                "approach_from_level": prev_band_level,
                 "crossed": crossed,
+                "from_prev_channel": from_prev,
             }
 
         if entry_id in open_entry_ids:
             row["status"] = "already_open"
             row["reason"] = "該 leg 已有持倉，不重複進場"
-        elif crossed:
+        elif touched:
             row["status"] = "touch_signal"
-            row["reason"] = "觸軌進場訊號"
+            row["reason"] = "自內側通道抵達並穿越進場"
         else:
             row["status"] = "no_touch"
             if side == "SHORT":
-                if high < level_f:
-                    row["reason"] = "未觸軌：最高價低於上軌"
-                elif prev_high >= prev_level_f:
-                    row["reason"] = "未觸軌：前一根已在上軌之上（非首次穿越）"
+                if not crossed:
+                    if high < level_f:
+                        row["reason"] = "未觸軌：最高價低於上軌"
+                    elif prev_high >= prev_level_f:
+                        row["reason"] = "未觸軌：前一根已在上軌之上（非首次穿越）"
+                    else:
+                        row["reason"] = "未觸軌"
+                elif not from_prev:
+                    inner = prev_band_col or "?"
+                    row["reason"] = (
+                        f"未自內側通道抵達：前一根未從 {inner} 區間來（可能在通道間徘徊）"
+                    )
                 else:
                     row["reason"] = "未觸軌"
             else:
-                if low > level_f:
-                    row["reason"] = "未觸軌：最低價高於下軌"
-                elif prev_low <= prev_level_f:
-                    row["reason"] = "未觸軌：前一根已在下軌之下（非首次穿越）"
+                if not crossed:
+                    if low > level_f:
+                        row["reason"] = "未觸軌：最低價高於下軌"
+                    elif prev_low <= prev_level_f:
+                        row["reason"] = "未觸軌：前一根已在下軌之下（非首次穿越）"
+                    else:
+                        row["reason"] = "未觸軌"
+                elif not from_prev:
+                    inner = prev_band_col or "?"
+                    row["reason"] = (
+                        f"未自內側通道抵達：前一根未從 {inner} 區間來（可能在通道間徘徊）"
+                    )
                 else:
                     row["reason"] = "未觸軌"
         rows.append(row)
@@ -250,31 +404,35 @@ def detect_entry_signals(
     curr: pd.Series,
     prev: pd.Series,
     open_entry_ids: set,
+    params: FibbParams = DEFAULT_PARAMS,
 ) -> List[Tuple[str, str, float, str]]:
     """
     回傳本根 K 線收盤可開倉的 leg 列表：(entry_id, side, qty, band_col)。
+    僅包含 trade_sides 允許的方向（both / long / short）。
     """
     signals: List[Tuple[str, str, float, str]] = []
-    for entry_id, side, qty, band in fibb_config.SHORT_LEGS:
+    for entry_id, side, qty, band in entry_legs_for_trade(params):
         if entry_id in open_entry_ids:
             continue
-        if _touch_short(curr, prev, band):
-            signals.append((entry_id, side, qty, band))
-    for entry_id, side, qty, band in fibb_config.LONG_LEGS:
-        if entry_id in open_entry_ids:
-            continue
-        if _touch_long(curr, prev, band):
+        if side == "SHORT":
+            if _touch_short(curr, prev, band, entry_id):
+                signals.append((entry_id, side, qty, band))
+        elif _touch_long(curr, prev, band, entry_id):
             signals.append((entry_id, side, qty, band))
     return signals
 
 
 def take_profit_price_pct(
-    side: str, entry_price: float, params: FibbParams = DEFAULT_PARAMS
+    side: str,
+    entry_price: float,
+    params: FibbParams = DEFAULT_PARAMS,
+    tp_pct_override: Optional[float] = None,
 ) -> float:
     """固定百分比止盈（tp_mode=0 或進場暫用 % 時）。"""
+    tp_pct = float(tp_pct_override) if tp_pct_override is not None else params.tp_pct
     if side == "LONG":
-        return entry_price * (1 + params.tp_pct)
-    return entry_price * (1 - params.tp_pct)
+        return entry_price * (1 + tp_pct)
+    return entry_price * (1 - tp_pct)
 
 
 def uses_channel_tp(entry_id: str, params: FibbParams) -> bool:
@@ -324,25 +482,37 @@ def refresh_reprice_tp_to_basis(
 
 
 def resolve_take_profit(
-    entry_id: str, side: str, entry_price: float, bar: pd.Series, params: FibbParams
+    entry_id: str,
+    side: str,
+    entry_price: float,
+    bar: pd.Series,
+    params: FibbParams,
+    tp_pct_override: Optional[float] = None,
 ) -> Tuple[float, str]:
     """回傳 (止盈價, 止盈通道欄位名；% 模式時欄位名為空字串)。"""
     if uses_channel_tp(entry_id, params):
         col = channel_tp_target_band(entry_id, side, params.channel_tp_offset)
         return channel_tp_level(entry_id, side, bar, params.channel_tp_offset), col
-    return take_profit_price_pct(side, entry_price, params), ""
+    return take_profit_price_pct(side, entry_price, params, tp_pct_override), ""
 
 
 def resolve_entry_take_profit(
-    entry_id: str, side: str, entry_price: float, bar: pd.Series, params: FibbParams
+    entry_id: str,
+    side: str,
+    entry_price: float,
+    bar: pd.Series,
+    params: FibbParams,
+    tp_pct_override: Optional[float] = None,
 ) -> Tuple[float, str]:
     """
     開倉當下止盈價。
     tp_mode=1：先固定 %（下一根 K 才跟 basis）；0/2 見 resolve_take_profit。
     """
     if params.tp_mode == 1:
-        return take_profit_price_pct(side, entry_price, params), ""
-    return resolve_take_profit(entry_id, side, entry_price, bar, params)
+        return take_profit_price_pct(side, entry_price, params, tp_pct_override), ""
+    return resolve_take_profit(
+        entry_id, side, entry_price, bar, params, tp_pct_override=tp_pct_override
+    )
 
 
 def bracket_prices(
@@ -359,6 +529,91 @@ def bracket_prices(
 
 def uses_deferred_channel_sl(entry_id: str, params: FibbParams) -> bool:
     return params.use_deferred_channel_sl and entry_id in DEFERRED_CHANNEL_SL
+
+
+def resolve_regime_controls(curr: pd.Series, params: FibbParams) -> Dict[str, Any]:
+    """Per-bar dynamic controls derived from 4H volatility/trend regime."""
+    range_pct = curr.get("h4_range_pct")
+    high_cut = curr.get("h4_range_pct_q_high")
+    basis_slope = curr.get("h4_basis_slope")
+    is_high_vol = False
+    if (
+        params.regime_enabled
+        and pd.notna(range_pct)
+        and pd.notna(high_cut)
+        and float(range_pct) >= float(high_cut)
+    ):
+        is_high_vol = True
+    trend = "flat"
+    if pd.notna(basis_slope):
+        if float(basis_slope) > 0:
+            trend = "up"
+        elif float(basis_slope) < 0:
+            trend = "down"
+    tp_pct = params.tp_pct
+    max_hold = params.max_holding_hours
+    if is_high_vol:
+        tp_pct = params.tp_pct * max(float(params.regime_high_vol_tp_mult), 0.0)
+        high_vol_hold = float(params.regime_high_vol_max_holding_hours)
+        if high_vol_hold > 0:
+            if max_hold > 0:
+                max_hold = min(max_hold, high_vol_hold)
+            else:
+                max_hold = high_vol_hold
+    return {
+        "is_high_vol": is_high_vol,
+        "trend": trend,
+        "tp_pct": tp_pct,
+        "max_holding_hours": max_hold,
+        "h4_range_pct": float(range_pct) if pd.notna(range_pct) else None,
+        "h4_range_pct_q_high": float(high_cut) if pd.notna(high_cut) else None,
+    }
+
+
+def should_block_entry_by_regime(
+    entry_id: str, side: str, curr: pd.Series, params: FibbParams
+) -> Tuple[bool, Optional[str]]:
+    controls = resolve_regime_controls(curr, params)
+    if not controls["is_high_vol"] or not params.regime_block_outer_countertrend:
+        return False, None
+    if entry_id not in {"T3 Short", "B3 Long"}:
+        return False, None
+    trend = controls["trend"]
+    if trend == "up" and side == "SHORT":
+        return True, "high_vol_countertrend_block"
+    if trend == "down" and side == "LONG":
+        return True, "high_vol_countertrend_block"
+    return False, None
+
+
+def _normalize_bar_ts(ts: pd.Timestamp) -> pd.Timestamp:
+    bar_ts = pd.Timestamp(ts)
+    if bar_ts.tzinfo is None:
+        return bar_ts.tz_localize("UTC")
+    return bar_ts.tz_convert("UTC")
+
+
+def leg_hold_expired(
+    leg: OpenLeg, bar_ts: pd.Timestamp, max_holding_hours: float
+) -> bool:
+    """True when leg has been open at least max_holding_hours (0 = disabled)."""
+    if max_holding_hours <= 0:
+        return False
+    entry = _normalize_bar_ts(leg.entry_time)
+    bar = _normalize_bar_ts(bar_ts)
+    return (bar - entry).total_seconds() >= max_holding_hours * 3600.0
+
+
+def try_time_stop_exit(
+    leg: OpenLeg,
+    bar_ts: pd.Timestamp,
+    close_price: float,
+    max_holding_hours: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    """Bar-close time stop when hold duration exceeds max_holding_hours."""
+    if not leg_hold_expired(leg, bar_ts, max_holding_hours):
+        return None, None
+    return close_price, "TIME_STOP"
 
 
 def try_exit_leg(
@@ -420,9 +675,9 @@ def arm_deferred_channel_stops(
         if leg is None or leg.stop_loss_price is not None:
             continue
         if leg.side == "SHORT":
-            outer_touch = _touch_short(curr, prev, outer_band)
+            outer_touch = _cross_short(curr, prev, outer_band)
         else:
-            outer_touch = _touch_long(curr, prev, outer_band)
+            outer_touch = _cross_long(curr, prev, outer_band)
         if not outer_touch:
             continue
         level = curr[inner_band]
@@ -455,6 +710,30 @@ def resolve_entry_qty(
     return float(int(max_qty))
 
 
+def leg_unrealized_gross_at_extreme(
+    leg: OpenLeg, bar_low: float, bar_high: float
+) -> float:
+    """持倉中該根 K 最不利價格下的毛浮盈虧（不含手續費）。"""
+    if leg.side == "LONG":
+        return leg.qty * (bar_low - leg.entry_price)
+    return leg.qty * (leg.entry_price - bar_high)
+
+
+def mark_open_legs_unrealized(
+    open_legs: Dict[str, OpenLeg], bar_low: float, bar_high: float
+) -> float:
+    """
+    更新各 leg 持倉期間最差浮盈虧，並回傳當根所有未平倉 leg 合計最不利毛浮盈虧。
+    """
+    total = 0.0
+    for leg in open_legs.values():
+        u = leg_unrealized_gross_at_extreme(leg, bar_low, bar_high)
+        total += u
+        if u < leg.worst_unrealized_gross:
+            leg.worst_unrealized_gross = u
+    return total
+
+
 def leg_pnl(
     leg: OpenLeg, exit_price: float, fee_rate: float
 ) -> Tuple[float, float, float]:
@@ -485,6 +764,7 @@ def run_fibb_backtest(
 
     open_legs: Dict[str, OpenLeg] = {}
     closed: List[dict] = []
+    portfolio_worst_unrealized_gross = 0.0
 
     for i in range(warmup, len(df)):
         curr = df.iloc[i]
@@ -496,14 +776,26 @@ def run_fibb_backtest(
         bar_high = float(curr["high"])
         bar_low = float(curr["low"])
         close_price = float(curr["close"])
+        controls = resolve_regime_controls(curr, params)
         in_entry_range = ts <= end_ts
 
         refresh_channel_take_profits(open_legs, curr, params)
 
-        # --- exits (intrabar) ---
+        if open_legs:
+            bar_open_unrealized = mark_open_legs_unrealized(
+                open_legs, bar_low, bar_high
+            )
+            if bar_open_unrealized < portfolio_worst_unrealized_gross:
+                portfolio_worst_unrealized_gross = bar_open_unrealized
+
+        # --- exits (intrabar TP/SL, then bar-close time stop) ---
         for entry_id in list(open_legs.keys()):
             leg = open_legs[entry_id]
             exit_price, reason = try_exit_leg(leg, bar_high, bar_low)
+            if exit_price is None:
+                exit_price, reason = try_time_stop_exit(
+                    leg, ts, close_price, controls["max_holding_hours"]
+                )
             if exit_price is None:
                 continue
             gross, fee, net = leg_pnl(leg, exit_price, params.fee_rate)
@@ -524,12 +816,21 @@ def run_fibb_backtest(
                     "exit_reason": reason,
                     "take_profit_hit": reason == "TAKE_PROFIT",
                     "stop_loss_hit": reason in ("STOP_LOSS", "CHANNEL_STOP"),
+                    "time_stop_hit": reason == "TIME_STOP",
                     "channel_stop_hit": reason == "CHANNEL_STOP",
                     "gross_pnl": gross,
                     "fee": fee,
                     "net_pnl": net,
                     "net_return": net / notional if notional else 0.0,
                     "win": net > 0,
+                    "holding_bars": max(1, i - leg.entry_bar_index),
+                    "max_unrealized_gross": float(leg.worst_unrealized_gross),
+                    "regime_is_high_vol": bool(controls["is_high_vol"]),
+                    "regime_trend": controls["trend"],
+                    "regime_h4_range_pct": controls["h4_range_pct"],
+                    "regime_h4_range_pct_q_high": controls["h4_range_pct_q_high"],
+                    "regime_tp_pct": float(controls["tp_pct"]),
+                    "regime_max_holding_hours": float(controls["max_holding_hours"]),
                 }
             )
             del open_legs[entry_id]
@@ -543,15 +844,23 @@ def run_fibb_backtest(
             continue
 
         equity = backtest_equity(closed, params)
-        signals = detect_entry_signals(curr, prev, set(open_legs.keys()))
+        signals = detect_entry_signals(curr, prev, set(open_legs.keys()), params)
         for entry_id, side, qty, band in signals:
             if len(open_legs) >= params.max_open_legs:
                 break
+            blocked, _ = should_block_entry_by_regime(entry_id, side, curr, params)
+            if blocked:
+                continue
             qty = resolve_entry_qty(qty, close_price, equity, params)
             if qty <= 0:
                 continue
             tp, tp_band = resolve_entry_take_profit(
-                entry_id, side, close_price, curr, params
+                entry_id,
+                side,
+                close_price,
+                curr,
+                params,
+                tp_pct_override=controls["tp_pct"],
             )
             if uses_deferred_channel_sl(entry_id, params):
                 # T2/B2：進場無止損，外層觸軌後由 arm_deferred_channel_stops 啟用通道止損
@@ -576,6 +885,8 @@ def run_fibb_backtest(
                 band=band,
                 take_profit_band=tp_band,
                 sl_use_channel=sl_channel,
+                entry_bar_index=i,
+                worst_unrealized_gross=0.0,
             )
 
         arm_deferred_channel_stops(open_legs, curr, prev, params)
@@ -587,10 +898,15 @@ def run_fibb_backtest(
     trades["cum_net_pnl"] = trades["net_pnl"].cumsum()
     trades["cum_peak"] = trades["cum_net_pnl"].cummax()
     trades["drawdown"] = trades["cum_net_pnl"] - trades["cum_peak"]
+    trades.attrs["portfolio_max_unrealized_gross"] = float(
+        portfolio_worst_unrealized_gross
+    )
     return trades
 
 
-def summarize_trades(trades: pd.DataFrame) -> dict:
+def summarize_trades(
+    trades: pd.DataFrame, *, bar_minutes: int = 15
+) -> dict:
     if trades.empty:
         return {
             "total_trades": 0,
@@ -600,12 +916,33 @@ def summarize_trades(trades: pd.DataFrame) -> dict:
             "win_rate": None,
             "profit_factor": None,
             "max_drawdown": 0.0,
+            "avg_holding_bars": None,
+            "max_holding_bars": None,
+            "avg_holding_minutes": None,
+            "max_holding_minutes": None,
+            "avg_max_unrealized_loss": None,
+            "max_unrealized_loss": None,
+            "portfolio_max_unrealized_loss": None,
         }
     wins = trades[trades["gross_pnl"] > 0]
     losses = trades[trades["gross_pnl"] <= 0]
     gross_profit = float(wins["gross_pnl"].sum()) if not wins.empty else 0.0
     gross_loss = float(losses["gross_pnl"].sum()) if not losses.empty else 0.0
     pf = abs(gross_profit / gross_loss) if gross_loss != 0 else None
+
+    holding_bars = trades["holding_bars"] if "holding_bars" in trades.columns else None
+    max_unrealized = (
+        trades["max_unrealized_gross"] if "max_unrealized_gross" in trades.columns else None
+    )
+    avg_bars = float(holding_bars.mean()) if holding_bars is not None else None
+    max_bars = int(holding_bars.max()) if holding_bars is not None else None
+    avg_minutes = avg_bars * bar_minutes if avg_bars is not None else None
+    max_minutes = max_bars * bar_minutes if max_bars is not None else None
+
+    avg_mae = float(max_unrealized.mean()) if max_unrealized is not None else None
+    worst_mae = float(max_unrealized.min()) if max_unrealized is not None else None
+    portfolio_mae = trades.attrs.get("portfolio_max_unrealized_gross")
+
     return {
         "total_trades": len(trades),
         "net_profit": float(trades["net_pnl"].sum()),
@@ -616,6 +953,18 @@ def summarize_trades(trades: pd.DataFrame) -> dict:
         "max_drawdown": float(trades["drawdown"].min()),
         "tp_hits": int(trades["take_profit_hit"].sum()),
         "sl_hits": int(trades["stop_loss_hit"].sum()),
+        "time_stop_hits": int(trades["time_stop_hit"].sum())
+        if "time_stop_hit" in trades.columns
+        else 0,
+        "avg_holding_bars": avg_bars,
+        "max_holding_bars": max_bars,
+        "avg_holding_minutes": avg_minutes,
+        "max_holding_minutes": max_minutes,
+        "avg_max_unrealized_loss": avg_mae,
+        "max_unrealized_loss": worst_mae,
+        "portfolio_max_unrealized_loss": (
+            float(portfolio_mae) if portfolio_mae is not None else None
+        ),
     }
 
 
