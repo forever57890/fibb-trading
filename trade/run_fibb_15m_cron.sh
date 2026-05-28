@@ -59,15 +59,15 @@ resolve_module() {
     "$REPO_ROOT/.."
     "$(pwd)"
   )
-  local root module
+  local root
   for root in "${roots[@]}"; do
     [ -d "$root" ] || continue
     if [ -f "$root/fibb_trading/trade/fibb_15m_trader.py" ]; then
-      echo "$root|fibb_trading.trade.fibb_15m_trader"
+      echo "$root|fibb_trading.trade.fibb_15m_trader|package"
       return 0
     fi
     if [ -f "$root/trade/fibb_15m_trader.py" ]; then
-      echo "$root|trade.fibb_15m_trader"
+      echo "$root|trade.fibb_15m_trader|flat"
       return 0
     fi
   done
@@ -84,15 +84,35 @@ module_info="$(resolve_module)" || {
   exit 127
 }
 MODULE_ROOT="${module_info%%|*}"
-ENTRY_MODULE="${module_info##*|}"
+rest="${module_info#*|}"
+ENTRY_MODULE="${rest%%|*}"
+LAYOUT_MODE="${module_info##*|}"
+export MODULE_ROOT
 
 export PYTHONPATH="${MODULE_ROOT}:${PYTHONPATH:-}"
 cd "$MODULE_ROOT"
 
 echo "[cron] python=$PYTHON dry_run=$FIBB_DRY_RUN"
-echo "[cron] module_root=$MODULE_ROOT entry_module=$ENTRY_MODULE"
+echo "[cron] module_root=$MODULE_ROOT entry_module=$ENTRY_MODULE layout=$LAYOUT_MODE"
 
-"$PYTHON" -m "$ENTRY_MODULE"
+if [ "$LAYOUT_MODE" = "flat" ]; then
+  # Flat layout has top-level dirs (core/, trade/, ...), but code imports fibb_trading.*.
+  # Inject a runtime namespace package alias so imports resolve without install step.
+  "$PYTHON" - <<PYCODE
+import os
+import runpy
+import sys
+import types
+
+root = os.environ["MODULE_ROOT"]
+pkg = types.ModuleType("fibb_trading")
+pkg.__path__ = [root]
+sys.modules["fibb_trading"] = pkg
+runpy.run_module("trade.fibb_15m_trader", run_name="__main__")
+PYCODE
+else
+  "$PYTHON" -m "$ENTRY_MODULE"
+fi
 exit_code=$?
 echo "[cron] ===== $(date -u +%Y-%m-%dT%H:%M:%SZ) done exit=$exit_code ====="
 exit "$exit_code"
