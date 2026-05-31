@@ -337,6 +337,7 @@ def process_bar(
                         f"已達 max_open_legs={params.max_open_legs}"
                     )
                 break
+            requested_qty = qty
             qty = resolve_entry_qty(qty, close_price, equity, params)
             if qty <= 0:
                 reason = "insufficient_equity"
@@ -348,6 +349,36 @@ def process_bar(
                     {"entry_id": entry_id, "skipped": True, "reason": reason}
                 )
                 continue
+            if trader is not None:
+                min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+                stepped_qty = trader.quantize_qty_down(symbol, qty)
+                order_qty = trader.prepare_order_qty(symbol, qty)
+                if order_qty <= 0:
+                    reason = "below_min_qty"
+                    max_notional = equity * params.leverage
+                    detail = (
+                        f"下單量 {qty}（策略 {requested_qty}）經 step 取整為 {stepped_qty}，"
+                        f"低於 minQty {min_qty}；"
+                        f"equity={equity:.2f} leverage={params.leverage} "
+                        f"close={close_price:.2f} max_notional≈{max_notional:.2f}"
+                    )
+                    if entry_id in diag_by_id:
+                        diag_by_id[entry_id]["blocked_reason"] = detail
+                    log["entries"].append(
+                        {
+                            "entry_id": entry_id,
+                            "skipped": True,
+                            "reason": reason,
+                            "requested_qty": requested_qty,
+                            "resolved_qty": qty,
+                            "stepped_qty": stepped_qty,
+                            "min_qty": min_qty,
+                            "equity": equity,
+                            "close": close_price,
+                        }
+                    )
+                    continue
+                qty = order_qty
             blocked, block_reason = should_block_entry_by_regime(
                 entry_id, side, curr, params
             )
@@ -396,6 +427,23 @@ def process_bar(
                     take_profit_price=channel_tp_at_open,
                     dry_run=dry_run,
                 )
+                if open_result.get("status") == "SKIPPED_BELOW_MIN_QTY":
+                    detail = (
+                        f"交易所 minQty {open_result.get('min_qty')}；"
+                        f"requested={open_result.get('requested_qty')} "
+                        f"stepped={open_result.get('stepped_qty')}"
+                    )
+                    if entry_id in diag_by_id:
+                        diag_by_id[entry_id]["blocked_reason"] = detail
+                    log["entries"].append(
+                        {
+                            "entry_id": entry_id,
+                            "skipped": True,
+                            "reason": "below_min_qty",
+                            "exchange": open_result,
+                        }
+                    )
+                    continue
                 exec_result["exchange"] = open_result
                 exec_result["tp_algo_id"] = open_result.get("tp_algo_id")
                 fill_entry = float(open_result.get("fill_entry_price") or close_price)

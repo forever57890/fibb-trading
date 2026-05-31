@@ -128,7 +128,19 @@ def open_leg_with_tp(
     使用該絕對價格掛 TP。
     """
     position_side = position_side_for_leg(side)
-    qty = trader.round_qty(symbol, qty)
+    requested_qty = qty
+    qty = trader.prepare_order_qty(symbol, qty)
+    if qty <= 0:
+        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+        stepped = trader.quantize_qty_down(symbol, requested_qty)
+        return {
+            "status": "SKIPPED_BELOW_MIN_QTY",
+            "symbol": symbol,
+            "position_side": position_side,
+            "requested_qty": requested_qty,
+            "stepped_qty": stepped,
+            "min_qty": min_qty,
+        }
     close_side = "SELL" if position_side == "LONG" else "BUY"
 
     if dry_run:

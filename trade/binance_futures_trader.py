@@ -154,12 +154,26 @@ class BinanceFuturesTrader:
         rounded = (d_value / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
         return float(rounded)
 
+    def quantize_qty_down(self, symbol: str, qty: float) -> float:
+        """Round down to LOT_SIZE step; result may be below minQty."""
+        step_size, _, _ = self.get_symbol_filters(symbol)
+        return self._round_step(qty, step_size)
+
+    def prepare_order_qty(self, symbol: str, qty: float) -> float:
+        """Exchange-valid quantity after step rounding, or 0.0 if below minQty."""
+        stepped = self.quantize_qty_down(symbol, qty)
+        min_qty = self._min_trade_qty(symbol)
+        return stepped if stepped >= min_qty else 0.0
+
     def round_qty(self, symbol: str, qty: float) -> float:
-        step_size, _, min_qty = self.get_symbol_filters(symbol)
-        qty = self._round_step(qty, step_size)
-        if qty < min_qty:
-            raise ValueError(f"Quantity {qty} is below minQty {min_qty} for {symbol}")
-        return qty
+        prepared = self.prepare_order_qty(symbol, qty)
+        if prepared <= 0:
+            stepped = self.quantize_qty_down(symbol, qty)
+            min_qty = self._min_trade_qty(symbol)
+            raise ValueError(
+                f"Quantity {stepped} is below minQty {min_qty} for {symbol}"
+            )
+        return prepared
 
     def round_price(self, symbol: str, price: float) -> float:
         _, tick_size, _ = self.get_symbol_filters(symbol)
