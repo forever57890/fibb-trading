@@ -39,7 +39,13 @@ def market_open_leg(
 ) -> Dict[str, Any]:
     """Increase LONG or SHORT leg by qty (hedge mode)."""
     position_side = position_side_for_leg(side)
-    qty = trader.round_qty(symbol, qty)
+    qty = trader.prepare_order_qty(symbol, qty)
+    if qty <= 0:
+        return {
+            "status": "SKIPPED_BELOW_MIN_QTY",
+            "symbol": symbol,
+            "position_side": position_side,
+        }
     if dry_run:
         return {
             "status": "DRY_RUN_OPEN",
@@ -48,7 +54,13 @@ def market_open_leg(
             "qty": qty,
         }
     current = abs(trader.get_position_amount(symbol, position_side))
-    target = trader.round_qty(symbol, current + qty)
+    target = trader.prepare_order_qty(symbol, current + qty)
+    if target <= 0:
+        return {
+            "status": "SKIPPED_BELOW_MIN_QTY",
+            "symbol": symbol,
+            "position_side": position_side,
+        }
     return trader.adjust_position_with_ioc_then_market(
         symbol,
         position_side,
@@ -238,7 +250,10 @@ def open_leg_with_tp(
         if raw_qty < min_qty:
             time.sleep(interval_ms / 1000.0)
             continue
-        order_qty = trader.round_qty(symbol, raw_qty)
+        order_qty = trader.prepare_order_qty(symbol, raw_qty)
+        if order_qty <= 0:
+            time.sleep(interval_ms / 1000.0)
+            continue
         ioc_order = trader.create_order(
             {
                 "symbol": symbol,
@@ -277,19 +292,20 @@ def open_leg_with_tp(
     remaining = min(remaining, max(0.0, qty - _leg_filled_total(open_leg)))
     if remaining >= min_qty:
         order_side = "BUY" if position_side == "LONG" else "SELL"
-        market_qty = trader.round_qty(symbol, remaining)
-        market_order = trader.create_order(
-            {
-                "symbol": symbol,
-                "side": order_side,
-                "positionSide": position_side,
-                "type": "MARKET",
-                "quantity": market_qty,
-            }
-        )
-        open_leg["market_remainder_qty"] = market_qty
-        open_leg["market_order"] = market_order
-        open_leg["status"] = "OPENED_IOC_THEN_MARKET"
+        market_qty = trader.prepare_order_qty(symbol, remaining)
+        if market_qty > 0:
+            market_order = trader.create_order(
+                {
+                    "symbol": symbol,
+                    "side": order_side,
+                    "positionSide": position_side,
+                    "type": "MARKET",
+                    "quantity": market_qty,
+                }
+            )
+            open_leg["market_remainder_qty"] = market_qty
+            open_leg["market_order"] = market_order
+            open_leg["status"] = "OPENED_IOC_THEN_MARKET"
     elif open_leg["pre_limit_filled_qty"] >= min_qty and open_leg["status"] in {
         "OPENED_IOC",
         "IOC_MAX_ATTEMPTS_REACHED",
@@ -319,14 +335,15 @@ def open_leg_with_tp(
 
     tp_algo_id = None
     tp_order = None
-    if final_leg_filled_qty >= (trader._min_trade_qty(symbol) or 0):
+    tp_qty = trader.prepare_order_qty(symbol, final_leg_filled_qty)
+    if tp_qty > 0:
         try:
             tp_order = trader.create_algo_conditional_order(
                 symbol=symbol,
                 side=close_side,
                 position_side=position_side,
                 order_type="TAKE_PROFIT_MARKET",
-                quantity=trader.round_qty(symbol, final_leg_filled_qty),
+                quantity=tp_qty,
                 trigger_price=tp_price,
             )
             tp_algo_id = tp_order.get("algoId") or tp_order.get("clientAlgoId")
@@ -379,8 +396,24 @@ def replace_leg_tp(
     """
     position_side = position_side_for_leg(side)
     close_side = "SELL" if position_side == "LONG" else "BUY"
-    rounded_qty = trader.round_qty(symbol, qty)
+    requested_qty = qty
+    rounded_qty = trader.prepare_order_qty(symbol, qty)
     tp_price = trader.round_price(symbol, take_profit_price)
+
+    if rounded_qty <= 0:
+        stepped = trader.quantize_qty_down(symbol, requested_qty)
+        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+        return {
+            "status": "SKIPPED_BELOW_MIN_QTY",
+            "position_side": position_side,
+            "requested_qty": requested_qty,
+            "stepped_qty": stepped,
+            "min_qty": min_qty,
+            "take_profit_price": tp_price,
+            "old_tp_algo_id": old_tp_algo_id,
+            "tp_algo_id": old_tp_algo_id,
+            "note": "保留既有 TP，不取消",
+        }
 
     if dry_run:
         return {
@@ -393,13 +426,6 @@ def replace_leg_tp(
         }
 
     cancel_result = cancel_leg_tp(trader, symbol, old_tp_algo_id)
-    if rounded_qty <= 0:
-        return {
-            "status": "NO_QTY",
-            "cancel": cancel_result,
-            "take_profit_price": tp_price,
-            "tp_algo_id": None,
-        }
 
     try:
         tp_order = trader.create_algo_conditional_order(
@@ -441,9 +467,29 @@ def close_leg_with_ioc(
     Mirrors open_leg_with_tp execution (exact leg qty, not full positionSide).
     """
     position_side = position_side_for_leg(side)
-    qty = trader.round_qty(symbol, qty)
+    requested_qty = qty
+    qty = trader.prepare_order_qty(symbol, qty)
+    if qty <= 0:
+        stepped = trader.quantize_qty_down(symbol, requested_qty)
+        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+        return {
+            "status": "SKIPPED_BELOW_MIN_QTY",
+            "symbol": symbol,
+            "position_side": position_side,
+            "requested_qty": requested_qty,
+            "stepped_qty": stepped,
+            "min_qty": min_qty,
+        }
     qty_before = abs(trader.get_position_amount(symbol, position_side))
-    current = trader.round_qty(symbol, min(qty, qty_before))
+    current = trader.prepare_order_qty(symbol, min(qty, qty_before))
+    if current <= 0:
+        return {
+            "status": "SKIPPED_NO_POSITION",
+            "symbol": symbol,
+            "position_side": position_side,
+            "requested_qty": requested_qty,
+            "qty_before": qty_before,
+        }
     min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
     interval_ms, max_attempts = trader._ioc_settings()  # noqa: SLF001
     wait_ms = trader._pre_ioc_limit_wait_ms()  # noqa: SLF001
@@ -545,7 +591,10 @@ def close_leg_with_ioc(
         if raw_qty < min_qty:
             time.sleep(interval_ms / 1000.0)
             continue
-        order_qty = trader.round_qty(symbol, raw_qty)
+        order_qty = trader.prepare_order_qty(symbol, raw_qty)
+        if order_qty <= 0:
+            time.sleep(interval_ms / 1000.0)
+            continue
         ioc_order = trader.create_order(
             {
                 "symbol": symbol,
@@ -584,19 +633,20 @@ def close_leg_with_ioc(
     remaining = min(remaining, max(0.0, current - _closed_total()))
     if remaining >= min_qty:
         order_side = "SELL" if position_side == "LONG" else "BUY"
-        market_qty = trader.round_qty(symbol, remaining)
-        market_order = trader.create_order(
-            {
-                "symbol": symbol,
-                "side": order_side,
-                "positionSide": position_side,
-                "type": "MARKET",
-                "quantity": market_qty,
-            }
-        )
-        close_leg["market_remainder_qty"] = market_qty
-        close_leg["market_order"] = market_order
-        close_leg["status"] = "CLOSED_IOC_THEN_MARKET"
+        market_qty = trader.prepare_order_qty(symbol, remaining)
+        if market_qty > 0:
+            market_order = trader.create_order(
+                {
+                    "symbol": symbol,
+                    "side": order_side,
+                    "positionSide": position_side,
+                    "type": "MARKET",
+                    "quantity": market_qty,
+                }
+            )
+            close_leg["market_remainder_qty"] = market_qty
+            close_leg["market_order"] = market_order
+            close_leg["status"] = "CLOSED_IOC_THEN_MARKET"
     elif close_leg["pre_limit_filled_qty"] >= min_qty and close_leg["status"] in {
         "CLOSED_IOC",
         "IOC_MAX_ATTEMPTS_REACHED",
@@ -631,10 +681,10 @@ def market_close_leg_qty(
 ) -> Dict[str, Any]:
     """Reduce one virtual leg by qty (partial close)."""
     position_side = position_side_for_leg(side)
-    qty = trader.round_qty(symbol, qty)
+    qty = trader.prepare_order_qty(symbol, qty)
     current = abs(trader.get_position_amount(symbol, position_side))
     if qty > current:
-        qty = trader.round_qty(symbol, current)
+        qty = trader.prepare_order_qty(symbol, current)
 
     if dry_run:
         return {

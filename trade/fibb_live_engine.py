@@ -5,7 +5,7 @@ One 15m bar step for live trading — same order as run_fibb_backtest:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
 
@@ -113,6 +113,7 @@ def _execute_leg_exit(
     fee_rate: float,
     log: Dict[str, Any],
     open_legs: Dict[str, OpenLeg],
+    on_checkpoint: Optional[Callable[[], None]] = None,
 ) -> None:
     exec_result: Dict[str, Any] = {
         "entry_id": entry_id,
@@ -125,9 +126,22 @@ def _execute_leg_exit(
         exec_result["cancel_tp"] = cancel_leg_tp(trader, symbol, tp_algo_id)
 
     if trader is not None:
-        exec_result["exchange"] = close_leg_with_ioc(
+        close_result = close_leg_with_ioc(
             trader, symbol, leg.side, leg.qty, dry_run=dry_run
         )
+        exec_result["exchange"] = close_result
+        if close_result.get("status") in {
+            "SKIPPED_BELOW_MIN_QTY",
+            "SKIPPED_NO_POSITION",
+        }:
+            log["exits"].append(
+                {
+                    **exec_result,
+                    "skipped": True,
+                    "reason": close_result.get("status"),
+                }
+            )
+            return
     elif dry_run:
         exec_result["exchange"] = {"status": "DRY_RUN_CLOSE"}
 
@@ -135,6 +149,8 @@ def _execute_leg_exit(
     append_closed_trade(state, closed)
     log["exits"].append({**exec_result, "trade": closed})
     del open_legs[entry_id]
+    if on_checkpoint is not None:
+        on_checkpoint()
 
 
 def _closed_stub(leg: OpenLeg, ts: pd.Timestamp, exit_price: float, reason: str, fee_rate: float) -> dict:
@@ -168,9 +184,13 @@ def process_bar(
     symbol: str = "BTCUSDT",
     dry_run: bool = False,
     wallet_equity: Optional[float] = None,
+    persist_state: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """
     Process a single closed 15m bar. Mutates *state* and returns action log.
+
+    When *persist_state* is set, state is flushed after claiming the bar and
+    after each successful exit/entry so parallel cron runs cannot duplicate trades.
     """
     if bar_index < 1:
         return {
@@ -207,6 +227,23 @@ def process_bar(
         return {"skipped": True, "reason": "already_processed", "bar_time": ts_iso}
 
     open_legs = open_legs_objects(state)
+    tp_algo_ids_updates: Dict[str, Any] = {}
+    new_tp_algo_ids: Dict[str, Any] = {}
+
+    def _checkpoint() -> None:
+        merged = {**tp_algo_ids_updates, **new_tp_algo_ids}
+        save_open_legs(
+            state,
+            open_legs,
+            tp_algo_ids=merged if merged else None,
+        )
+        state.last_bar_time = ts_iso
+        if persist_state is not None:
+            persist_state()
+
+    state.last_bar_time = ts_iso
+    _checkpoint()
+    log_claimed = True
 
     bar_high = float(curr["high"])
     bar_low = float(curr["low"])
@@ -223,6 +260,8 @@ def process_bar(
         "hold_diagnostics": [],
         "regime": controls,
         "trade_sides": params.trade_sides,
+        "bar_claimed": log_claimed,
+        "one_entry_per_bar": True,
     }
 
     if trader is not None and not dry_run:
@@ -275,9 +314,9 @@ def process_bar(
             fee_rate=params.fee_rate,
             log=log,
             open_legs=open_legs,
+            on_checkpoint=_checkpoint,
         )
 
-    tp_algo_ids_updates: Dict[str, Any] = {}
     log["tp_mode"] = params.tp_mode
     log["tp_mode_label"] = tp_mode_label(params.tp_mode)
     if params.tp_mode == 1:
@@ -325,8 +364,6 @@ def process_bar(
         equity = float(wallet_equity)
     else:
         equity = params.initial_capital + state.realized_pnl
-
-    new_tp_algo_ids: Dict[str, Any] = {}
 
     if len(open_legs) < params.max_open_legs:
         signals = detect_entry_signals(curr, prev, set(open_legs.keys()), params)
@@ -491,6 +528,13 @@ def process_bar(
             if entry_id in diag_by_id:
                 diag_by_id[entry_id]["status"] = "opened"
                 diag_by_id[entry_id]["reason"] = "已開倉"
+            _checkpoint()
+            for other_id, diag in diag_by_id.items():
+                if other_id == entry_id:
+                    continue
+                if diag.get("status") == "touch_signal":
+                    diag["blocked_reason"] = "本根 K 已開一筆，略過其餘訊號"
+            break
     elif entry_diagnostics:
         for d in entry_diagnostics:
             if d.get("status") == "touch_signal":
@@ -513,13 +557,7 @@ def process_bar(
                 }
             )
 
-    combined_tp_algo_ids = {**tp_algo_ids_updates, **new_tp_algo_ids}
-    save_open_legs(
-        state,
-        open_legs,
-        tp_algo_ids=combined_tp_algo_ids if combined_tp_algo_ids else None,
-    )
-    state.last_bar_time = ts_iso
+    _checkpoint()
     log["open_legs_after"] = list(state.open_legs.keys())
     return log
 

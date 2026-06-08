@@ -94,8 +94,17 @@ class TestFibbLogic(unittest.TestCase):
 
     def test_resolve_entry_qty_caps_by_equity(self):
         params = FibbParams(initial_capital=100_000.0, leverage=2.0)
-        self.assertEqual(resolve_entry_qty(2.0, 150_000.0, 100_000.0, params), 1.0)
-        self.assertEqual(resolve_entry_qty(2.0, 250_000.0, 100_000.0, params), 0.0)
+        self.assertAlmostEqual(
+            resolve_entry_qty(2.0, 150_000.0, 100_000.0, params),
+            100_000.0 * 2.0 / 150_000.0,
+        )
+        self.assertAlmostEqual(
+            resolve_entry_qty(2.0, 250_000.0, 100_000.0, params),
+            100_000.0 * 2.0 / 250_000.0,
+        )
+        self.assertAlmostEqual(
+            resolve_entry_qty(0.01, 200_000.0, 1.0, params), 1.0 * 2.0 / 200_000.0
+        )
 
     def test_bracket_prices_long(self):
         params = FibbParams(tp_mode=0, tp_pct=0.01, sl_pct=0.01)

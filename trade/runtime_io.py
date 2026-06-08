@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 PathLike = Union[str, Path]
 
@@ -68,3 +75,42 @@ def safe_append_log(path: PathLike, text: str) -> None:
         f.write(text)
         if not text.endswith("\n"):
             f.write("\n")
+
+
+@contextmanager
+def single_instance_lock(
+    lock_path: PathLike,
+    *,
+    blocking: bool = False,
+) -> Iterator[bool]:
+    """
+    Exclusive flock so only one trader process runs at a time.
+
+    Yields True when the lock was acquired, False if another instance holds it
+    (non-blocking mode only).
+    """
+    if fcntl is None:
+        yield True
+        return
+
+    file_path = Path(lock_path)
+    ensure_runtime_dir(file_path.parent)
+    fd = os.open(str(file_path), os.O_CREAT | os.O_RDWR, 0o644)
+    acquired = False
+    try:
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, flags)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run FiBB 15m trader once (crontab at :01, :16, :31, :46 UTC recommended).
+# Avoid :00/:15/:30/:45 if other jobs run on the exact quarter-hour.
 #
 #   TZ=UTC
 #   1,16,31,46 * * * * /bin/bash /path/to/fibb_trading/trade/run_fibb_15m_cron.sh

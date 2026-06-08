@@ -705,9 +705,9 @@ def resolve_entry_qty(
     max_qty = (equity * params.leverage) / entry_price
     if max_qty >= requested_qty:
         return requested_qty
-    if max_qty < 1.0:
+    if max_qty <= 0:
         return 0.0
-    return float(int(max_qty))
+    return max_qty
 
 
 def leg_unrealized_gross_at_extreme(

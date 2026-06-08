@@ -359,6 +359,12 @@ def build_run_summary_lines(result: dict) -> List[str]:
 
     if result.get("error"):
         lines.append(f"ERROR: {result['error']}")
+        if result.get("traceback"):
+            tb = result["traceback"].strip().splitlines()
+            if tb:
+                lines.append(f"  at: {tb[-1]}")
+        if result.get("error_hint"):
+            lines.append(f"  hint: {result['error_hint']}")
 
     lines.append("=" * 72)
     return lines

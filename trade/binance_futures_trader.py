@@ -166,6 +166,9 @@ class BinanceFuturesTrader:
         return stepped if stepped >= min_qty else 0.0
 
     def round_qty(self, symbol: str, qty: float) -> float:
+        """
+        嚴格驗證用：不足 minQty 時拋錯。實盤流程請用 prepare_order_qty() 並自行 skip。
+        """
         prepared = self.prepare_order_qty(symbol, qty)
         if prepared <= 0:
             stepped = self.quantize_qty_down(symbol, qty)
@@ -453,7 +456,8 @@ class BinanceFuturesTrader:
         min_qty = self._min_trade_qty(symbol)
         if remaining < min_qty:
             return 0.0, current
-        return self.round_qty(symbol, remaining), current
+        order_qty = self.prepare_order_qty(symbol, remaining)
+        return (order_qty if order_qty > 0 else 0.0), current
 
     def _pre_limit_order_params(
         self, symbol: str, position_side: str, mode: str
@@ -615,7 +619,7 @@ class BinanceFuturesTrader:
         max_attempts = max_attempts if max_attempts is not None else default_max
 
         min_qty = self._min_trade_qty(symbol)
-        target_qty = self.round_qty(symbol, target_qty)
+        target_qty = self.prepare_order_qty(symbol, target_qty)
         initial_qty = abs(self.get_position_amount(symbol, position_side))
 
         leg: Dict[str, Any] = {
@@ -676,8 +680,8 @@ class BinanceFuturesTrader:
             order_side, price, level_qty = self._ioc_order_params(
                 symbol, position_side, mode
             )
-            order_qty = self.round_qty(symbol, min(remaining, level_qty))
-            if order_qty < min_qty:
+            order_qty = self.prepare_order_qty(symbol, min(remaining, level_qty))
+            if order_qty <= 0:
                 time.sleep(interval_sec)
                 continue
 
@@ -725,7 +729,9 @@ class BinanceFuturesTrader:
         remaining = target_qty - current if mode == "open" else current
 
         if remaining >= min_qty:
-            remainder = self.round_qty(symbol, remaining)
+            remainder = self.prepare_order_qty(symbol, remaining)
+            if remainder <= 0:
+                return leg
             order_side, _, _ = self._ioc_order_params(symbol, position_side, mode)
             market_order = self.create_order(
                 {
@@ -935,7 +941,7 @@ class BinanceFuturesTrader:
             result["account_after_entry"] = self.check_account(symbol=symbol)
             return result
 
-        filled_qty = self.round_qty(symbol, filled_qty)
+        filled_qty = self.prepare_order_qty(symbol, filled_qty)
         result["account_after_entry"] = self.check_account(symbol=symbol)
 
         tp_order = self.create_algo_conditional_order(
