@@ -51,6 +51,62 @@ from fibb_trading.trade.live_state import (
 )
 
 
+def _clear_virtual_leg(
+    entry_id: str,
+    leg: OpenLeg,
+    *,
+    state: LiveState,
+    open_legs: Dict[str, OpenLeg],
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Drop a virtual leg from state and cancel its exchange TP if present."""
+    record: Dict[str, Any] = {"entry_id": entry_id, "side": leg.side, "qty": leg.qty, "reason": reason}
+    if trader is not None:
+        tp_algo_id = get_tp_algo_id(state, entry_id)
+        if tp_algo_id is not None:
+            record["cancel_tp"] = cancel_leg_tp(trader, symbol, tp_algo_id)
+    open_legs.pop(entry_id, None)
+    return record
+
+
+def _reconcile_flat_exchange_legs(
+    *,
+    open_legs: Dict[str, OpenLeg],
+    state: LiveState,
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    dry_run: bool,
+    log: Dict[str, Any],
+    on_checkpoint: Callable[[], None],
+) -> None:
+    """State has open legs but exchange is flat — clear ghosts before exit logic runs."""
+    if trader is None or dry_run:
+        return
+    min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+    for side in ("LONG", "SHORT"):
+        exchange_amt = abs(trader.get_position_amount(symbol, side))
+        if exchange_amt >= min_qty:
+            continue
+        for entry_id in list(open_legs.keys()):
+            leg = open_legs.get(entry_id)
+            if leg is None or leg.side != side:
+                continue
+            cleared = _clear_virtual_leg(
+                entry_id,
+                leg,
+                state=state,
+                open_legs=open_legs,
+                trader=trader,
+                symbol=symbol,
+                reason="EXCHANGE_FLAT_RECONCILE",
+            )
+            log.setdefault("stale_cleared", []).append(cleared)
+    if log.get("stale_cleared"):
+        on_checkpoint()
+
+
 def _sync_exchange_take_profits(
     *,
     open_legs: Dict[str, OpenLeg],
@@ -126,6 +182,25 @@ def _execute_leg_exit(
         exec_result["cancel_tp"] = cancel_leg_tp(trader, symbol, tp_algo_id)
 
     if trader is not None:
+        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+        exchange_amt = abs(trader.get_position_amount(symbol, leg.side))
+        if exchange_amt < min_qty:
+            cleared = _clear_virtual_leg(
+                entry_id,
+                leg,
+                state=state,
+                open_legs=open_legs,
+                trader=trader,
+                symbol=symbol,
+                reason="NO_EXCHANGE_POSITION",
+            )
+            log.setdefault("stale_cleared", []).append(
+                {**exec_result, **cleared, "exit_signal": reason}
+            )
+            if on_checkpoint is not None:
+                on_checkpoint()
+            return
+
         close_result = close_leg_with_ioc(
             trader, symbol, leg.side, leg.qty, dry_run=dry_run
         )
@@ -134,13 +209,20 @@ def _execute_leg_exit(
             "SKIPPED_BELOW_MIN_QTY",
             "SKIPPED_NO_POSITION",
         }:
-            log["exits"].append(
-                {
-                    **exec_result,
-                    "skipped": True,
-                    "reason": close_result.get("status"),
-                }
+            cleared = _clear_virtual_leg(
+                entry_id,
+                leg,
+                state=state,
+                open_legs=open_legs,
+                trader=trader,
+                symbol=symbol,
+                reason=close_result.get("status", "CLOSE_SKIPPED"),
             )
+            log.setdefault("stale_cleared", []).append(
+                {**exec_result, **cleared, "exit_signal": reason}
+            )
+            if on_checkpoint is not None:
+                on_checkpoint()
             return
     elif dry_run:
         exec_result["exchange"] = {"status": "DRY_RUN_CLOSE"}
@@ -255,6 +337,7 @@ def process_bar(
         "close": close_price,
         "exits": [],
         "entries": [],
+        "stale_cleared": [],
         "armed_stops": [],
         "tp_reprices": [],
         "hold_diagnostics": [],
@@ -285,6 +368,15 @@ def process_bar(
                         ],
                     }
                 )
+        _reconcile_flat_exchange_legs(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            on_checkpoint=_checkpoint,
+        )
 
     old_channel_tps: Dict[str, float] = {}
     if tp_mode_channel_tracks_bar(params):

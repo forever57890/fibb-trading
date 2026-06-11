@@ -122,6 +122,15 @@ def _leg_filled_total(open_leg: Dict[str, Any]) -> float:
     )
 
 
+def _tp_trigger_valid(side: str, mark_price: float, trigger_price: float) -> bool:
+    """Binance TP must be on the profitable side of mark or it can fill immediately."""
+    if mark_price <= 0 or trigger_price <= 0:
+        return False
+    if side == "LONG":
+        return trigger_price > mark_price
+    return trigger_price < mark_price
+
+
 def open_leg_with_tp(
     trader: BinanceFuturesTrader,
     symbol: str,
@@ -337,6 +346,9 @@ def open_leg_with_tp(
     tp_order = None
     tp_qty = trader.prepare_order_qty(symbol, final_leg_filled_qty)
     if tp_qty > 0:
+        mark_price = trader.get_mark_price(symbol)
+        if not _tp_trigger_valid(side, mark_price, tp_price):
+            tp_price = trader.round_price(symbol, _tp_price_from_pct(side, fill_entry, tp_pct))
         try:
             tp_order = trader.create_algo_conditional_order(
                 symbol=symbol,
@@ -423,6 +435,18 @@ def replace_leg_tp(
             "take_profit_price": tp_price,
             "old_tp_algo_id": old_tp_algo_id,
             "tp_algo_id": old_tp_algo_id,
+        }
+
+    mark_price = trader.get_mark_price(symbol)
+    if not _tp_trigger_valid(side, mark_price, tp_price):
+        return {
+            "status": "SKIPPED_INVALID_TP",
+            "position_side": position_side,
+            "take_profit_price": tp_price,
+            "mark_price": mark_price,
+            "old_tp_algo_id": old_tp_algo_id,
+            "tp_algo_id": old_tp_algo_id,
+            "note": "TP trigger on wrong side of mark; kept existing TP",
         }
 
     cancel_result = cancel_leg_tp(trader, symbol, old_tp_algo_id)

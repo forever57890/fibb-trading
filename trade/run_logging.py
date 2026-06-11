@@ -42,6 +42,7 @@ def summarize_bar(bar: Optional[dict]) -> Dict[str, Any]:
     entries = bar.get("entries") or []
     opened = [e for e in entries if not e.get("skipped")]
     skipped_entries = [e for e in entries if e.get("skipped")]
+    closed = [e for e in (bar.get("exits") or []) if not e.get("skipped")]
     diag = bar.get("entry_diagnostics") or []
     touch_signals = [d for d in diag if d.get("status") == "touch_signal"]
     already_open = [d for d in diag if d.get("status") == "already_open"]
@@ -52,7 +53,7 @@ def summarize_bar(bar: Optional[dict]) -> Dict[str, Any]:
         "close": bar.get("close"),
         "skipped": bar.get("skipped"),
         "skip_reason": bar.get("reason"),
-        "exit_count": len(bar.get("exits") or []),
+        "exit_count": len(closed),
         "entry_opened_count": len(opened),
         "entry_skipped_count": len(skipped_entries),
         "armed_stop_count": len(bar.get("armed_stops") or []),
@@ -78,15 +79,19 @@ def build_bar_headline(bar: dict) -> tuple[str, str]:
             return ("SKIPPED_INSUFFICIENT_HISTORY", "略過：歷史 K 線不足，無法計算通道")
         return ("SKIPPED", f"略過：{reason}")
 
-    exits = bar.get("exits") or []
+    exits = [e for e in (bar.get("exits") or []) if not e.get("skipped")]
     entries = bar.get("entries") or []
     opened = [e for e in entries if not e.get("skipped")]
+    stale = bar.get("stale_cleared") or []
     diag = bar.get("entry_diagnostics") or []
 
     parts: List[str] = []
     if exits:
         ids = [e.get("entry_id") for e in exits]
         parts.append(f"平倉 {len(exits)} 筆：{', '.join(ids)}")
+    if stale:
+        ids = [e.get("entry_id") for e in stale]
+        parts.append(f"清除幽靈 leg {len(stale)} 筆：{', '.join(ids)}")
     if opened:
         ids = [e.get("entry_id") for e in opened]
         parts.append(f"開倉 {len(opened)} 筆：{', '.join(ids)}")
