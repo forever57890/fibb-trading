@@ -53,7 +53,7 @@ _STRATEGY_PARAMS = configure_strategy_from_env(reload_env=False)
 _TRADE_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("FIBB_RUNTIME_DIR", str(_TRADE_ROOT / "runtime")))
 STATE_FILE = RUNTIME_DIR / "fibb_15m_state.json"
-LOCK_FILE = RUNTIME_DIR / "fibb_15m.lock"
+LOCK_FILE = Path(os.getenv("FIBB_TRADE_LOCK", str(RUNTIME_DIR / "fibb_trade.lock")))
 LOG_FILE = RUNTIME_DIR / "fibb_15m_runs.log"
 
 SYMBOL = os.getenv("FIBB_SYMBOL", "BTCUSDT")

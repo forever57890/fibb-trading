@@ -17,10 +17,20 @@ class LiveState:
     open_legs: Dict[str, dict] = None  # type: ignore
     realized_pnl: float = 0.0
     trade_count: int = 0
+    # Realtime intrabar: entry_ids opened on the current forming 15m bar
+    intrabar_bar_time: Optional[str] = None
+    intrabar_opened: Optional[List[str]] = None
+    last_finalize_bar_time: Optional[str] = None
+    # bar_time_iso -> entry_ids already claimed/opened (prevents duplicate leg on same bar)
+    bar_entry_claims: Optional[Dict[str, List[str]]] = None
 
     def __post_init__(self) -> None:
         if self.open_legs is None:
             self.open_legs = {}
+        if self.intrabar_opened is None:
+            self.intrabar_opened = []
+        if self.bar_entry_claims is None:
+            self.bar_entry_claims = {}
 
     def to_dict(self) -> dict:
         return {
@@ -28,15 +38,28 @@ class LiveState:
             "open_legs": self.open_legs,
             "realized_pnl": self.realized_pnl,
             "trade_count": self.trade_count,
+            "intrabar_bar_time": self.intrabar_bar_time,
+            "intrabar_opened": list(self.intrabar_opened or []),
+            "last_finalize_bar_time": self.last_finalize_bar_time,
+            "bar_entry_claims": dict(self.bar_entry_claims or {}),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "LiveState":
+        raw_claims = data.get("bar_entry_claims") or {}
+        claims = {
+            str(k): list(v) if isinstance(v, (list, tuple)) else []
+            for k, v in raw_claims.items()
+        }
         return cls(
             last_bar_time=data.get("last_bar_time"),
             open_legs=dict(data.get("open_legs") or {}),
             realized_pnl=float(data.get("realized_pnl") or 0.0),
             trade_count=int(data.get("trade_count") or 0),
+            intrabar_bar_time=data.get("intrabar_bar_time"),
+            intrabar_opened=list(data.get("intrabar_opened") or []),
+            last_finalize_bar_time=data.get("last_finalize_bar_time"),
+            bar_entry_claims=claims,
         )
 
 
@@ -92,3 +115,32 @@ def save_open_legs(
 def append_closed_trade(state: LiveState, record: dict) -> None:
     state.realized_pnl += float(record.get("net_pnl") or 0.0)
     state.trade_count += 1
+
+
+def bar_entry_claim_ids(state: LiveState, bar_time_iso: str) -> set:
+    claims = state.bar_entry_claims or {}
+    return set(claims.get(bar_time_iso) or [])
+
+
+def claim_bar_entry(state: LiveState, bar_time_iso: str, entry_id: str) -> bool:
+    """
+    Reserve entry_id for this bar (persist before exchange call).
+
+    Returns False if this leg was already claimed on this bar.
+    """
+    claims = dict(state.bar_entry_claims or {})
+    ids = list(claims.get(bar_time_iso) or [])
+    if entry_id in ids:
+        return False
+    ids.append(entry_id)
+    claims[bar_time_iso] = ids
+    state.bar_entry_claims = claims
+    return True
+
+
+def prune_bar_entry_claims(state: LiveState, *, keep_last: int = 32) -> None:
+    claims = state.bar_entry_claims or {}
+    if len(claims) <= keep_last:
+        return
+    keys = sorted(claims.keys())
+    state.bar_entry_claims = {k: claims[k] for k in keys[-keep_last:]}

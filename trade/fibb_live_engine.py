@@ -5,6 +5,7 @@ One 15m bar step for live trading — same order as run_fibb_backtest:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
@@ -44,11 +45,28 @@ from fibb_trading.trade.exchange import (
 from fibb_trading.trade.live_state import (
     LiveState,
     append_closed_trade,
+    bar_entry_claim_ids,
+    claim_bar_entry,
     get_tp_algo_id,
     leg_from_dict,
     open_legs_objects,
+    prune_bar_entry_claims,
     save_open_legs,
 )
+
+LEG_OPEN_GRACE_SEC = float(os.getenv("FIBB_LEG_OPEN_GRACE_SEC", "90"))
+
+
+def _leg_in_open_grace(leg: OpenLeg, now: pd.Timestamp) -> bool:
+    """Skip reconcile-clear right after open while exchange position propagates."""
+    try:
+        opened = pd.Timestamp(leg.entry_time)
+        if opened.tzinfo is None:
+            opened = opened.tz_localize("UTC")
+        now_ts = pd.Timestamp(now).tz_convert("UTC")
+        return (now_ts - opened).total_seconds() < LEG_OPEN_GRACE_SEC
+    except Exception:
+        return False
 
 
 def _clear_virtual_leg(
@@ -85,6 +103,7 @@ def _reconcile_flat_exchange_legs(
     if trader is None or dry_run:
         return
     min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+    now = pd.Timestamp.now(tz="UTC")
     for side in ("LONG", "SHORT"):
         exchange_amt = abs(trader.get_position_amount(symbol, side))
         if exchange_amt >= min_qty:
@@ -92,6 +111,8 @@ def _reconcile_flat_exchange_legs(
         for entry_id in list(open_legs.keys()):
             leg = open_legs.get(entry_id)
             if leg is None or leg.side != side:
+                continue
+            if _leg_in_open_grace(leg, now):
                 continue
             cleared = _clear_virtual_leg(
                 entry_id,
@@ -458,8 +479,15 @@ def process_bar(
         equity = params.initial_capital + state.realized_pnl
 
     if len(open_legs) < params.max_open_legs:
-        signals = detect_entry_signals(curr, prev, set(open_legs.keys()), params)
+        signals = detect_entry_signals(
+            curr,
+            prev,
+            set(open_legs.keys()) | bar_entry_claim_ids(state, ts_iso),
+            params,
+        )
         for entry_id, side, qty, band in signals:
+            if entry_id in open_legs:
+                continue
             if len(open_legs) >= params.max_open_legs:
                 if entry_id in diag_by_id:
                     diag_by_id[entry_id]["blocked_reason"] = (
@@ -522,6 +550,16 @@ def process_bar(
                     }
                 )
                 continue
+
+            if not claim_bar_entry(state, ts_iso, entry_id):
+                reason = "already_claimed_this_bar"
+                if entry_id in diag_by_id:
+                    diag_by_id[entry_id]["blocked_reason"] = "本根 K 已 claim 此 leg，不重複開倉"
+                log["entries"].append(
+                    {"entry_id": entry_id, "skipped": True, "reason": reason}
+                )
+                continue
+            _checkpoint()
 
             entry_tp, tp_band = resolve_entry_take_profit(
                 entry_id,
@@ -637,6 +675,398 @@ def process_bar(
     log["entry_diagnostics"] = entry_diagnostics
 
     # --- arm deferred stops (after entries, same as backtest) ---
+    before_arm = {k: v.stop_loss_price for k, v in open_legs.items()}
+    arm_deferred_channel_stops(open_legs, curr, prev, params)
+    for entry_id, leg in open_legs.items():
+        if before_arm.get(entry_id) is None and leg.stop_loss_price is not None:
+            log["armed_stops"].append(
+                {
+                    "entry_id": entry_id,
+                    "stop_loss_price": leg.stop_loss_price,
+                    "sl_use_channel": leg.sl_use_channel,
+                }
+            )
+
+    _checkpoint()
+    prune_bar_entry_claims(state)
+    log["open_legs_after"] = list(state.open_legs.keys())
+    return log
+
+
+def _reset_intrabar_state(state: LiveState, bar_time_iso: str) -> None:
+    if state.intrabar_bar_time != bar_time_iso:
+        state.intrabar_bar_time = bar_time_iso
+        state.intrabar_opened = []
+
+
+def _intrabar_checkpoint(
+    state: LiveState,
+    open_legs: Dict[str, OpenLeg],
+    tp_algo_ids_updates: Dict[str, Any],
+    new_tp_algo_ids: Dict[str, Any],
+    persist_state: Optional[Callable[[], None]],
+) -> None:
+    merged = {**tp_algo_ids_updates, **new_tp_algo_ids}
+    save_open_legs(
+        state,
+        open_legs,
+        tp_algo_ids=merged if merged else None,
+    )
+    if persist_state is not None:
+        persist_state()
+
+
+def process_intrabar_tick(
+    df: pd.DataFrame,
+    curr: pd.Series,
+    prev: pd.Series,
+    state: LiveState,
+    params: FibbParams,
+    *,
+    trader: Optional[BinanceFuturesTrader] = None,
+    symbol: str = "BTCUSDT",
+    dry_run: bool = False,
+    wallet_equity: Optional[float] = None,
+    persist_state: Optional[Callable[[], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Realtime step on the forming 15m bar: exit checks + immediate entry on touch.
+
+    Unlike process_bar(), does not wait for bar close. Tracks intrabar_opened so
+    each leg fires at most once per forming bar (and one entry per bar overall).
+    """
+    ts = curr["open_time"]
+    ts_iso = pd.Timestamp(ts).isoformat()
+    _reset_intrabar_state(state, ts_iso)
+
+    open_legs = open_legs_objects(state)
+    tp_algo_ids_updates: Dict[str, Any] = {}
+    new_tp_algo_ids: Dict[str, Any] = {}
+    intrabar_opened = set(state.intrabar_opened or [])
+
+    def _checkpoint() -> None:
+        state.intrabar_opened = list(intrabar_opened)
+        _intrabar_checkpoint(
+            state, open_legs, tp_algo_ids_updates, new_tp_algo_ids, persist_state
+        )
+
+    bar_high = float(curr["high"])
+    bar_low = float(curr["low"])
+    close_price = float(curr["close"])
+    controls = resolve_regime_controls(curr, params)
+
+    log: Dict[str, Any] = {
+        "mode": "intrabar",
+        "bar_time": ts_iso,
+        "close": close_price,
+        "exits": [],
+        "entries": [],
+        "stale_cleared": [],
+        "armed_stops": [],
+        "tp_reprices": [],
+        "hold_diagnostics": [],
+        "regime": controls,
+        "trade_sides": params.trade_sides,
+        "one_entry_per_bar": True,
+    }
+
+    if trader is not None and not dry_run:
+        _reconcile_flat_exchange_legs(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            on_checkpoint=_checkpoint,
+        )
+
+    if tp_mode_channel_tracks_bar(params):
+        refresh_channel_take_profits(open_legs, curr, params)
+
+    for entry_id in list(open_legs.keys()):
+        leg = open_legs[entry_id]
+        exit_price, reason = try_exit_leg(leg, bar_high, bar_low)
+        if exit_price is None:
+            continue
+        _execute_leg_exit(
+            entry_id=entry_id,
+            leg=leg,
+            ts=ts,
+            exit_price=exit_price,
+            reason=reason,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            fee_rate=params.fee_rate,
+            log=log,
+            open_legs=open_legs,
+            on_checkpoint=_checkpoint,
+        )
+
+    blocked_ids = (
+        set(open_legs.keys()) | intrabar_opened | bar_entry_claim_ids(state, ts_iso)
+    )
+    if len(open_legs) < params.max_open_legs:
+        if params.initial_capital <= 0 or params.leverage <= 0:
+            equity = float(wallet_equity or 1e12)
+        elif wallet_equity is not None:
+            equity = float(wallet_equity)
+        else:
+            equity = params.initial_capital + state.realized_pnl
+
+        signals = detect_entry_signals(curr, prev, blocked_ids, params)
+        for entry_id, side, qty, band in signals:
+            if entry_id in blocked_ids or entry_id in open_legs:
+                continue
+            if len(open_legs) >= params.max_open_legs:
+                break
+            if entry_id in intrabar_opened:
+                continue
+
+            requested_qty = qty
+            qty = resolve_entry_qty(qty, close_price, equity, params)
+            if qty <= 0:
+                log["entries"].append(
+                    {"entry_id": entry_id, "skipped": True, "reason": "insufficient_equity"}
+                )
+                continue
+
+            if trader is not None:
+                order_qty = trader.prepare_order_qty(symbol, qty)
+                if order_qty <= 0:
+                    log["entries"].append(
+                        {"entry_id": entry_id, "skipped": True, "reason": "below_min_qty"}
+                    )
+                    continue
+                qty = order_qty
+
+            blocked, block_reason = should_block_entry_by_regime(
+                entry_id, side, curr, params
+            )
+            if blocked:
+                log["entries"].append(
+                    {"entry_id": entry_id, "skipped": True, "reason": block_reason}
+                )
+                continue
+
+            if not claim_bar_entry(state, ts_iso, entry_id):
+                log["entries"].append(
+                    {
+                        "entry_id": entry_id,
+                        "skipped": True,
+                        "reason": "already_claimed_this_bar",
+                    }
+                )
+                continue
+            intrabar_opened.add(entry_id)
+            _checkpoint()
+
+            entry_tp, tp_band = resolve_entry_take_profit(
+                entry_id,
+                side,
+                close_price,
+                curr,
+                params,
+                tp_pct_override=controls["tp_pct"],
+            )
+            channel_tp_at_open = entry_tp if tp_mode_uses_channel(params) else None
+            if uses_deferred_channel_sl(entry_id, params):
+                sl, sl_channel = None, False
+            elif not params.use_deferred_channel_sl:
+                _, sl = bracket_prices(side, close_price, params)
+                sl_channel = False
+            else:
+                sl, sl_channel = None, False
+
+            exec_result: Dict[str, Any] = {"entry_id": entry_id, "qty": qty, "side": side}
+            fill_entry = close_price
+            tp = None
+
+            if trader is not None:
+                open_result = open_leg_with_tp(
+                    trader,
+                    symbol,
+                    side,
+                    qty,
+                    controls["tp_pct"],
+                    signal_close=close_price,
+                    take_profit_price=channel_tp_at_open,
+                    dry_run=dry_run,
+                )
+                if open_result.get("status") == "SKIPPED_BELOW_MIN_QTY":
+                    log["entries"].append(
+                        {
+                            "entry_id": entry_id,
+                            "skipped": True,
+                            "reason": "below_min_qty",
+                            "exchange": open_result,
+                        }
+                    )
+                    continue
+                exec_result["exchange"] = open_result
+                exec_result["tp_algo_id"] = open_result.get("tp_algo_id")
+                fill_entry = float(open_result.get("fill_entry_price") or close_price)
+                tp = float(open_result.get("take_profit_price") or 0)
+                new_tp_algo_ids[entry_id] = open_result.get("tp_algo_id")
+                leg_qty = float(open_result.get("final_leg_filled_qty") or qty)
+                qty = leg_qty if leg_qty > 0 else qty
+                exec_result["leg_qty"] = qty
+            elif dry_run:
+                tp = take_profit_price_pct(side, fill_entry, params)
+                exec_result["exchange"] = {"status": "DRY_RUN_OPEN"}
+
+            if tp is None:
+                tp = (
+                    entry_tp
+                    if tp_mode_uses_channel(params)
+                    else take_profit_price_pct(
+                        side, fill_entry, params, tp_pct_override=controls["tp_pct"]
+                    )
+                )
+
+            open_legs[entry_id] = OpenLeg(
+                entry_id=entry_id,
+                side=side,
+                qty=qty,
+                entry_time=ts,
+                entry_price=fill_entry,
+                take_profit_price=tp,
+                stop_loss_price=sl,
+                band=band,
+                take_profit_band=tp_band,
+                sl_use_channel=sl_channel,
+            )
+            log["entries"].append(exec_result)
+            _checkpoint()
+            break
+
+    log["open_legs_after"] = list(open_legs.keys())
+    log["had_action"] = bool(
+        log["exits"] or [e for e in log["entries"] if not e.get("skipped")]
+    )
+    return log
+
+
+def finalize_closed_bar(
+    df: pd.DataFrame,
+    bar_index: int,
+    state: LiveState,
+    params: FibbParams,
+    *,
+    trader: Optional[BinanceFuturesTrader] = None,
+    symbol: str = "BTCUSDT",
+    dry_run: bool = False,
+    wallet_equity: Optional[float] = None,
+    persist_state: Optional[Callable[[], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Run once when a 15m bar closes: time-stop, TP reprice, deferred SL arming.
+    Skips entries (handled intrabar by process_intrabar_tick).
+    """
+    curr = df.iloc[bar_index]
+    prev = df.iloc[bar_index - 1] if bar_index >= 1 else curr
+    ts_iso = pd.Timestamp(curr["open_time"]).isoformat()
+
+    if state.last_finalize_bar_time == ts_iso:
+        return {"skipped": True, "reason": "already_finalized", "bar_time": ts_iso}
+
+    open_legs = open_legs_objects(state)
+    tp_algo_ids_updates: Dict[str, Any] = {}
+
+    def _checkpoint() -> None:
+        save_open_legs(state, open_legs, tp_algo_ids=tp_algo_ids_updates or None)
+        state.last_bar_time = ts_iso
+        state.last_finalize_bar_time = ts_iso
+        state.intrabar_bar_time = None
+        state.intrabar_opened = []
+        if persist_state is not None:
+            persist_state()
+
+    bar_high = float(curr["high"])
+    bar_low = float(curr["low"])
+    close_price = float(curr["close"])
+    controls = resolve_regime_controls(curr, params)
+    ts = curr["open_time"]
+
+    log: Dict[str, Any] = {
+        "mode": "finalize",
+        "bar_time": ts_iso,
+        "exits": [],
+        "stale_cleared": [],
+        "tp_reprices": [],
+        "armed_stops": [],
+    }
+
+    if trader is not None and not dry_run:
+        _reconcile_flat_exchange_legs(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            on_checkpoint=_checkpoint,
+        )
+
+    old_channel_tps: Dict[str, float] = {}
+    if tp_mode_channel_tracks_bar(params):
+        old_channel_tps = {eid: leg.take_profit_price for eid, leg in open_legs.items()}
+        refresh_channel_take_profits(open_legs, curr, params)
+
+    for entry_id in list(open_legs.keys()):
+        leg = open_legs[entry_id]
+        exit_price, reason = try_exit_leg(leg, bar_high, bar_low)
+        if exit_price is None:
+            exit_price, reason = try_time_stop_exit(
+                leg, ts, close_price, controls["max_holding_hours"]
+            )
+        if exit_price is None:
+            continue
+        _execute_leg_exit(
+            entry_id=entry_id,
+            leg=leg,
+            ts=ts,
+            exit_price=exit_price,
+            reason=reason,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            fee_rate=params.fee_rate,
+            log=log,
+            open_legs=open_legs,
+            on_checkpoint=_checkpoint,
+        )
+
+    if params.tp_mode == 1:
+        old_tps = {eid: leg.take_profit_price for eid, leg in open_legs.items()}
+        refresh_reprice_tp_to_basis(open_legs, curr, params)
+        _sync_exchange_take_profits(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            tp_algo_ids_updates=tp_algo_ids_updates,
+            reprice_kind="basis",
+            old_tp_by_id=old_tps,
+        )
+    elif tp_mode_channel_tracks_bar(params) and open_legs:
+        _sync_exchange_take_profits(
+            open_legs=open_legs,
+            state=state,
+            trader=trader,
+            symbol=symbol,
+            dry_run=dry_run,
+            log=log,
+            tp_algo_ids_updates=tp_algo_ids_updates,
+            reprice_kind="channel",
+            old_tp_by_id=old_channel_tps,
+        )
+
     before_arm = {k: v.stop_loss_price for k, v in open_legs.items()}
     arm_deferred_channel_stops(open_legs, curr, prev, params)
     for entry_id, leg in open_legs.items():
