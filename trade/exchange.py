@@ -208,6 +208,9 @@ def open_leg_with_tp(
         "status": "NOOP",
     }
 
+    # Drop stale entry limits from failed parallel runs before placing a new one.
+    open_leg["cancel_stale_limits"] = trader.cancel_regular_open_orders(symbol)
+
     # 1) Pre-limit for this leg qty only (not target position).
     pre_side, pre_price = trader._pre_limit_order_params(symbol, position_side, "open")  # noqa: SLF001
     pre_order = trader.create_order(

@@ -45,6 +45,7 @@ from fibb_trading.trade.runtime_io import (
     safe_read_json,
     safe_write_json,
     single_instance_lock,
+    state_file_lock,
 )
 
 load_fibb_env()
@@ -54,6 +55,9 @@ _TRADE_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("FIBB_RUNTIME_DIR", str(_TRADE_ROOT / "runtime")))
 STATE_FILE = RUNTIME_DIR / "fibb_15m_state.json"
 LOCK_FILE = Path(os.getenv("FIBB_TRADE_LOCK", str(RUNTIME_DIR / "fibb_trade.lock")))
+LEG_LOCKS_DIR = Path(
+    os.getenv("FIBB_LEG_LOCKS_DIR", str(LOCK_FILE.parent / "leg_locks"))
+)
 LOG_FILE = RUNTIME_DIR / "fibb_15m_runs.log"
 
 SYMBOL = os.getenv("FIBB_SYMBOL", "BTCUSDT")
@@ -158,6 +162,7 @@ def run_once() -> Dict[str, Any]:
         dry_run=DRY_RUN,
         wallet_equity=equity,
         persist_state=lambda: save_state(state),
+        leg_locks_dir=LEG_LOCKS_DIR,
     )
     record["bar"] = bar_log
     record["bar_index"] = bar_index
@@ -186,23 +191,25 @@ def run_once() -> Dict[str, Any]:
 def main() -> int:
     try:
         ensure_runtime_dir(RUNTIME_DIR)
-        with single_instance_lock(LOCK_FILE, blocking=False) as acquired:
-            if not acquired:
-                record = enrich_run_record(
-                    {
-                        "run_at": utc_now_iso(),
-                        "action": "SKIPPED_ALREADY_RUNNING",
-                        "config": build_config_snapshot(),
-                        "error_hint": (
-                            "另一個 FiBB trader 正在執行（flock）；"
-                            "略過本次以避免重複下單"
-                        ),
-                    }
-                )
-                append_log(record)
-                print_run_output(record)
-                return 0
-            record = run_once()
+        ensure_runtime_dir(LEG_LOCKS_DIR)
+        with state_file_lock(STATE_FILE, blocking=True):
+            with single_instance_lock(LOCK_FILE, blocking=False) as acquired:
+                if not acquired:
+                    record = enrich_run_record(
+                        {
+                            "run_at": utc_now_iso(),
+                            "action": "SKIPPED_ALREADY_RUNNING",
+                            "config": build_config_snapshot(),
+                            "error_hint": (
+                                "另一個 FiBB trader 正在執行（flock）；"
+                                "略過本次以避免重複下單"
+                            ),
+                        }
+                    )
+                    append_log(record)
+                    print_run_output(record)
+                    return 0
+                record = run_once()
         print_run_output(record)
         if record.get("action") == "ERROR":
             return 1

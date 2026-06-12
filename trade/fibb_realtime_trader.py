@@ -61,6 +61,7 @@ from fibb_trading.trade.runtime_io import (
     safe_read_json,
     safe_write_json,
     single_instance_lock,
+    state_file_lock,
 )
 
 load_fibb_env()
@@ -69,6 +70,9 @@ _TRADE_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("FIBB_RT_RUNTIME_DIR", str(_TRADE_ROOT / "runtime_realtime")))
 STATE_FILE = RUNTIME_DIR / "fibb_realtime_state.json"
 LOCK_FILE = Path(os.getenv("FIBB_TRADE_LOCK", str(_TRADE_ROOT / "runtime" / "fibb_trade.lock")))
+LEG_LOCKS_DIR = Path(
+    os.getenv("FIBB_LEG_LOCKS_DIR", str(LOCK_FILE.parent / "leg_locks"))
+)
 LOG_FILE = RUNTIME_DIR / "fibb_realtime_runs.log"
 
 SYMBOL = os.getenv("FIBB_RT_SYMBOL", os.getenv("FIBB_SYMBOL", "BTCUSDT"))
@@ -176,26 +180,48 @@ class RealtimeEngine:
 
     def handle_kline(self, k: dict) -> None:
         with self.lock:
-            self.refresh_klines()
-            if self.df is None or not history_ready(self.df, self.params):
-                return
+            with state_file_lock(STATE_FILE, blocking=True):
+                self.state = load_state()
+                self.refresh_klines()
+                if self.df is None or not history_ready(self.df, self.params):
+                    return
 
-            if self.forming is None:
-                self.forming = FormingBar.from_kline(k)
-            elif self.forming.open_time == pd.Timestamp(int(k["t"]), unit="ms", tz="UTC"):
-                self.forming.merge_kline(k)
-            else:
-                self.forming = FormingBar.from_kline(k)
+                if self.forming is None:
+                    self.forming = FormingBar.from_kline(k)
+                elif self.forming.open_time == pd.Timestamp(int(k["t"]), unit="ms", tz="UTC"):
+                    self.forming.merge_kline(k)
+                else:
+                    self.forming = FormingBar.from_kline(k)
 
-            equity = wallet_equity_usdt(self.trader) if self.trader else None
-            persist = lambda: save_state(self.state)
+                equity = wallet_equity_usdt(self.trader) if self.trader else None
+                persist = lambda: save_state(self.state)
 
-            if k.get("x"):
-                self.refresh_klines(force=True)
-                bar_index = latest_closed_bar_index(self.df)
-                fin_log = finalize_closed_bar(
+                if k.get("x"):
+                    self.refresh_klines(force=True)
+                    bar_index = latest_closed_bar_index(self.df)
+                    fin_log = finalize_closed_bar(
+                        self.df,
+                        bar_index,
+                        self.state,
+                        self.params,
+                        trader=self.trader,
+                        symbol=SYMBOL,
+                        dry_run=DRY_RUN,
+                        wallet_equity=equity,
+                        persist_state=persist,
+                        leg_locks_dir=LEG_LOCKS_DIR,
+                    )
+                    if not fin_log.get("skipped"):
+                        self._log_tick("FINALIZED", fin_log)
+                    self.forming = None
+                    save_state(self.state)
+                    return
+
+                curr, prev = build_curr_prev(self.df, self.forming, self.params)
+                tick_log = process_intrabar_tick(
                     self.df,
-                    bar_index,
+                    curr,
+                    prev,
                     self.state,
                     self.params,
                     trader=self.trader,
@@ -203,27 +229,11 @@ class RealtimeEngine:
                     dry_run=DRY_RUN,
                     wallet_equity=equity,
                     persist_state=persist,
+                    leg_locks_dir=LEG_LOCKS_DIR,
                 )
-                if not fin_log.get("skipped"):
-                    self._log_tick("FINALIZED", fin_log)
-                self.forming = None
-                return
-
-            curr, prev = build_curr_prev(self.df, self.forming, self.params)
-            tick_log = process_intrabar_tick(
-                self.df,
-                curr,
-                prev,
-                self.state,
-                self.params,
-                trader=self.trader,
-                symbol=SYMBOL,
-                dry_run=DRY_RUN,
-                wallet_equity=equity,
-                persist_state=persist,
-            )
-            if tick_log.get("had_action"):
-                self._log_tick("INTRABAR", tick_log)
+                save_state(self.state)
+                if tick_log.get("had_action"):
+                    self._log_tick("INTRABAR", tick_log)
 
     def poll_mark_fallback(self) -> None:
         """REST fallback when WebSocket is unavailable."""
@@ -321,6 +331,7 @@ def main() -> int:
     use_ws = os.getenv("FIBB_RT_USE_WS", "1") == "1"
     try:
         ensure_runtime_dir(RUNTIME_DIR)
+        ensure_runtime_dir(LEG_LOCKS_DIR)
         with single_instance_lock(LOCK_FILE, blocking=False) as acquired:
             if not acquired:
                 print("[realtime] another instance is running; exit", file=sys.stderr)

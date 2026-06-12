@@ -63,9 +63,88 @@ def safe_read_json(
 
 
 def safe_write_json(path: PathLike, data: dict) -> None:
+    """Atomic write so concurrent readers never see partial JSON."""
     file_path = Path(path)
     ensure_runtime_dir(file_path.parent)
-    file_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, file_path)
+
+
+def _leg_lock_name(bar_time_iso: str, entry_id: str) -> str:
+    safe_bar = bar_time_iso.replace(":", "").replace("+", "_")
+    safe_id = entry_id.replace(" ", "_")
+    return f"{safe_bar}__{safe_id}.lock"
+
+
+def try_acquire_leg_entry_lock(
+    locks_dir: PathLike,
+    bar_time_iso: str,
+    entry_id: str,
+) -> bool:
+    """
+    Cross-process mutex: one open attempt per (bar, entry_id).
+
+    Uses O_EXCL so parallel cron / websocket workers cannot double-enter.
+    """
+    root = ensure_runtime_dir(locks_dir)
+    path = root / _leg_lock_name(bar_time_iso, entry_id)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, f"{bar_time_iso}\n{entry_id}\n".encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_leg_entry_lock(
+    locks_dir: PathLike,
+    bar_time_iso: str,
+    entry_id: str,
+) -> None:
+    path = Path(locks_dir) / _leg_lock_name(bar_time_iso, entry_id)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@contextmanager
+def state_file_lock(
+    state_path: PathLike,
+    *,
+    blocking: bool = True,
+) -> Iterator[bool]:
+    """Exclusive flock on the state JSON file for the whole read-modify-write cycle."""
+    if fcntl is None:
+        yield True
+        return
+
+    file_path = Path(state_path)
+    ensure_runtime_dir(file_path.parent)
+    if not file_path.exists():
+        file_path.write_text("{}", encoding="utf-8")
+
+    fd = os.open(str(file_path), os.O_RDWR)
+    acquired = False
+    try:
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, flags)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def safe_append_log(path: PathLike, text: str) -> None:

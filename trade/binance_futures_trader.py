@@ -399,6 +399,18 @@ class BinanceFuturesTrader:
             signed=True,
         )
 
+    def cancel_regular_open_orders(self, symbol: str) -> Dict[str, Any]:
+        """Cancel regular limit/IOC orders only (keeps algo TP/SL)."""
+        try:
+            return self._request(
+                "DELETE",
+                "/fapi/v1/allOpenOrders",
+                params={"symbol": symbol},
+                signed=True,
+            )
+        except BinanceFuturesAPIError as exc:
+            return {"error": str(exc.payload)}
+
     def cancel_open_orders(self, symbol: str) -> Dict[str, Any]:
         """Cancel regular limit/IOC orders and algo TP/SL before close."""
         regular: Dict[str, Any] = {}

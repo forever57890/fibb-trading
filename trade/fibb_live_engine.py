@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 from typing import Any, Callable, Dict, Optional
 
+from pathlib import Path
+
 import pandas as pd
 
 from fibb_trading.core.fibb_config import (
@@ -35,6 +37,9 @@ from fibb_trading.core.fibb_logic import (
     try_time_stop_exit,
     uses_deferred_channel_sl,
 )
+from fibb_trading.trade.runtime_io import (
+    try_acquire_leg_entry_lock,
+)
 from fibb_trading.trade.exchange import (
     BinanceFuturesTrader,
     cancel_leg_tp,
@@ -55,6 +60,65 @@ from fibb_trading.trade.live_state import (
 )
 
 LEG_OPEN_GRACE_SEC = float(os.getenv("FIBB_LEG_OPEN_GRACE_SEC", "90"))
+
+
+def _untracked_exchange_qty(log: Dict[str, Any], side: str) -> float:
+    for mm in log.get("position_mismatch") or []:
+        if mm.get("side") == side:
+            return float(mm.get("excess") or 0)
+    return 0.0
+
+
+def _leg_locks_dir(runtime_dir: Optional[Path]) -> Optional[Path]:
+    if runtime_dir is None:
+        return None
+    return Path(runtime_dir) / "leg_locks"
+
+
+def _collect_position_mismatches(
+    open_legs: Dict[str, OpenLeg],
+    trader: BinanceFuturesTrader,
+    symbol: str,
+) -> list[Dict[str, Any]]:
+    min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
+    mismatches: list[Dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        exchange_amt = abs(trader.get_position_amount(symbol, side))
+        virtual_amt = sum(leg.qty for leg in open_legs.values() if leg.side == side)
+        if exchange_amt > virtual_amt + min_qty * 2:
+            mismatches.append(
+                {
+                    "side": side,
+                    "exchange_amt": exchange_amt,
+                    "virtual_amt": virtual_amt,
+                    "excess": round(exchange_amt - virtual_amt, 8),
+                    "open_leg_ids": [
+                        leg.entry_id for leg in open_legs.values() if leg.side == side
+                    ],
+                }
+            )
+    return mismatches
+
+
+def _untracked_blocks_entry(
+    log: Dict[str, Any],
+    side: str,
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    *,
+    dry_run: bool,
+) -> Optional[str]:
+    if trader is None or dry_run:
+        return None
+    excess = _untracked_exchange_qty(log, side)
+    if excess <= 0:
+        return None
+    threshold = trader._min_trade_qty(symbol) * 2  # noqa: SLF001
+    if excess <= threshold:
+        return None
+    return (
+        f"交易所 {side} 有 {excess:.8f} 未追蹤倉位，暫停該方向開倉"
+    )
 
 
 def _leg_in_open_grace(leg: OpenLeg, now: pd.Timestamp) -> bool:
@@ -288,6 +352,7 @@ def process_bar(
     dry_run: bool = False,
     wallet_equity: Optional[float] = None,
     persist_state: Optional[Callable[[], None]] = None,
+    leg_locks_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Process a single closed 15m bar. Mutates *state* and returns action log.
@@ -369,26 +434,9 @@ def process_bar(
     }
 
     if trader is not None and not dry_run:
-        min_qty = trader._min_trade_qty(symbol)  # noqa: SLF001
-        for side in ("LONG", "SHORT"):
-            exchange_amt = abs(trader.get_position_amount(symbol, side))
-            virtual_amt = sum(
-                leg.qty for leg in open_legs.values() if leg.side == side
-            )
-            if exchange_amt > virtual_amt + min_qty * 2:
-                log.setdefault("position_mismatch", []).append(
-                    {
-                        "side": side,
-                        "exchange_amt": exchange_amt,
-                        "virtual_amt": virtual_amt,
-                        "excess": round(exchange_amt - virtual_amt, 8),
-                        "open_leg_ids": [
-                            leg.entry_id
-                            for leg in open_legs.values()
-                            if leg.side == side
-                        ],
-                    }
-                )
+        log["position_mismatch"] = _collect_position_mismatches(
+            open_legs, trader, symbol
+        )
         _reconcile_flat_exchange_legs(
             open_legs=open_legs,
             state=state,
@@ -548,6 +596,36 @@ def process_bar(
                         "skipped": True,
                         "reason": block_reason,
                     }
+                )
+                continue
+
+            untracked_reason = _untracked_blocks_entry(
+                log, side, trader, symbol, dry_run=dry_run
+            )
+            if untracked_reason:
+                if entry_id in diag_by_id:
+                    diag_by_id[entry_id]["blocked_reason"] = untracked_reason
+                log["entries"].append(
+                    {
+                        "entry_id": entry_id,
+                        "skipped": True,
+                        "reason": "untracked_exchange_position",
+                        "detail": untracked_reason,
+                    }
+                )
+                continue
+
+            locks_dir = leg_locks_dir
+            if locks_dir is not None and not try_acquire_leg_entry_lock(
+                locks_dir, ts_iso, entry_id
+            ):
+                reason = "leg_lock_held"
+                if entry_id in diag_by_id:
+                    diag_by_id[entry_id]["blocked_reason"] = (
+                        "另一進程已鎖定此 bar/leg 開倉"
+                    )
+                log["entries"].append(
+                    {"entry_id": entry_id, "skipped": True, "reason": reason}
                 )
                 continue
 
@@ -728,6 +806,7 @@ def process_intrabar_tick(
     dry_run: bool = False,
     wallet_equity: Optional[float] = None,
     persist_state: Optional[Callable[[], None]] = None,
+    leg_locks_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Realtime step on the forming 15m bar: exit checks + immediate entry on touch.
@@ -771,6 +850,9 @@ def process_intrabar_tick(
     }
 
     if trader is not None and not dry_run:
+        log["position_mismatch"] = _collect_position_mismatches(
+            open_legs, trader, symbol
+        )
         _reconcile_flat_exchange_legs(
             open_legs=open_legs,
             state=state,
@@ -848,6 +930,33 @@ def process_intrabar_tick(
             if blocked:
                 log["entries"].append(
                     {"entry_id": entry_id, "skipped": True, "reason": block_reason}
+                )
+                continue
+
+            untracked_reason = _untracked_blocks_entry(
+                log, side, trader, symbol, dry_run=dry_run
+            )
+            if untracked_reason:
+                log["entries"].append(
+                    {
+                        "entry_id": entry_id,
+                        "skipped": True,
+                        "reason": "untracked_exchange_position",
+                        "detail": untracked_reason,
+                    }
+                )
+                continue
+
+            locks_dir = leg_locks_dir
+            if locks_dir is not None and not try_acquire_leg_entry_lock(
+                locks_dir, ts_iso, entry_id
+            ):
+                log["entries"].append(
+                    {
+                        "entry_id": entry_id,
+                        "skipped": True,
+                        "reason": "leg_lock_held",
+                    }
                 )
                 continue
 
@@ -960,6 +1069,7 @@ def finalize_closed_bar(
     dry_run: bool = False,
     wallet_equity: Optional[float] = None,
     persist_state: Optional[Callable[[], None]] = None,
+    leg_locks_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run once when a 15m bar closes: time-stop, TP reprice, deferred SL arming.
