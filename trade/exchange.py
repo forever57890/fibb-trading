@@ -122,6 +122,59 @@ def _leg_filled_total(open_leg: Dict[str, Any]) -> float:
     )
 
 
+def _position_amount(trader: BinanceFuturesTrader, symbol: str, position_side: str) -> float:
+    return abs(trader.get_position_amount(symbol, position_side))
+
+
+def _open_leg_filled_qty(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    position_side: str,
+    qty_before: float,
+    leg_qty: float,
+) -> float:
+    """How much of this leg open actually reached the exchange (source of truth)."""
+    delta = _position_amount(trader, symbol, position_side) - qty_before
+    return min(leg_qty, max(0.0, delta))
+
+
+def _open_leg_remaining_qty(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    position_side: str,
+    qty_before: float,
+    leg_qty: float,
+) -> float:
+    return max(0.0, leg_qty - _open_leg_filled_qty(trader, symbol, position_side, qty_before, leg_qty))
+
+
+def _close_leg_closed_qty(qty_before: float, qty_after: float, leg_qty: float) -> float:
+    return min(leg_qty, max(0.0, qty_before - qty_after))
+
+
+def _close_leg_remaining_qty(
+    trader: BinanceFuturesTrader,
+    symbol: str,
+    position_side: str,
+    qty_before: float,
+    leg_qty: float,
+) -> float:
+    qty_after = _position_amount(trader, symbol, position_side)
+    return max(0.0, leg_qty - _close_leg_closed_qty(qty_before, qty_after, leg_qty))
+
+
+def _order_fill_qty(
+    trader: BinanceFuturesTrader, symbol: str, order: Dict[str, Any]
+) -> float:
+    executed = float(order.get("executedQty") or 0)
+    if executed > 0:
+        return executed
+    order_id = order.get("orderId")
+    if order_id is None:
+        return 0.0
+    return _order_executed_qty(trader, symbol, order_id)
+
+
 def _tp_trigger_valid(side: str, mark_price: float, trigger_price: float) -> bool:
     """Binance TP must be on the profitable side of mark or it can fill immediately."""
     if mark_price <= 0 or trigger_price <= 0:
@@ -234,28 +287,44 @@ def open_leg_with_tp(
 
     time.sleep(wait_ms / 1000.0)
     pre_order_id = pre_order.get("orderId")
-    pre_filled = min(qty, _order_executed_qty(trader, symbol, pre_order_id))
+    pos_mid = _position_amount(trader, symbol, position_side)
+    pre_filled = min(qty, max(0.0, pos_mid - qty_before))
+    pre_filled = min(
+        qty,
+        max(pre_filled, min(qty, _order_executed_qty(trader, symbol, pre_order_id))),
+    )
     if pre_order_id is not None:
         try:
             open_leg["pre_limit"]["cancel"] = trader.cancel_order(symbol, int(pre_order_id))
+            pos_after_cancel = _position_amount(trader, symbol, position_side)
             pre_filled = min(
                 qty,
-                max(pre_filled, _order_executed_qty(trader, symbol, pre_order_id)),
+                max(
+                    pre_filled,
+                    max(0.0, pos_after_cancel - qty_before),
+                    min(qty, _order_executed_qty(trader, symbol, pre_order_id)),
+                ),
             )
         except BinanceFuturesAPIError as exc:
             open_leg["pre_limit"]["cancel_error"] = str(exc.payload)
 
-    open_leg["pre_limit_filled_qty"] = pre_filled
-    remaining = max(0.0, qty - pre_filled)
+    # Drop unfilled passive limits so IOC does not stack on a live GTC.
+    try:
+        open_leg["pre_limit"]["cancel_open_orders"] = trader.cancel_regular_open_orders(symbol)
+        pos_after_sweep = _position_amount(trader, symbol, position_side)
+        pre_filled = min(qty, max(pre_filled, max(0.0, pos_after_sweep - qty_before)))
+    except BinanceFuturesAPIError as exc:
+        open_leg["pre_limit"]["cancel_open_orders_error"] = str(exc.payload)
 
-    # 2) IOC loop for the remainder of this leg.
+    open_leg["pre_limit_filled_qty"] = pre_filled
+
+    # 2) IOC loop for the remainder of this leg (position delta is source of truth).
     for attempt in range(1, max_attempts + 1):
-        if _leg_filled_total(open_leg) >= qty - 1e-12:
-            open_leg["status"] = "OPENED_LEG_QTY_FULL"
-            break
-        remaining = min(remaining, max(0.0, qty - _leg_filled_total(open_leg)))
+        remaining = _open_leg_remaining_qty(
+            trader, symbol, position_side, qty_before, qty
+        )
         if remaining < min_qty:
-            open_leg["status"] = "OPENED_IOC"
+            open_leg["status"] = "OPENED_LEG_QTY_FULL"
             break
         side_ioc, price_ioc, level_qty = trader._ioc_order_params(symbol, position_side, "open")  # noqa: SLF001
         raw_qty = min(remaining, level_qty)
@@ -277,9 +346,17 @@ def open_leg_with_tp(
                 "price": price_ioc,
             }
         )
-        executed = float(ioc_order.get("executedQty") or 0)
-        remaining = max(0.0, remaining - executed)
-        open_leg["ioc_filled_qty"] += executed
+        executed = _order_fill_qty(trader, symbol, ioc_order)
+        position_filled = _open_leg_filled_qty(
+            trader, symbol, position_side, qty_before, qty
+        )
+        open_leg["ioc_filled_qty"] = max(
+            float(open_leg.get("ioc_filled_qty") or 0),
+            max(0.0, position_filled - pre_filled),
+        )
+        remaining = _open_leg_remaining_qty(
+            trader, symbol, position_side, qty_before, qty
+        )
         open_leg["ioc_attempts"].append(
             {
                 "attempt": attempt,
@@ -287,6 +364,7 @@ def open_leg_with_tp(
                 "price": price_ioc,
                 "order_qty": order_qty,
                 "executed_qty": executed,
+                "position_filled_qty": position_filled,
                 "book_level_qty": level_qty,
                 "remaining_after": remaining,
                 "order_id": ioc_order.get("orderId"),
@@ -301,7 +379,7 @@ def open_leg_with_tp(
         open_leg["status"] = "IOC_MAX_ATTEMPTS_REACHED"
 
     # 3) MARKET fill the final remainder for this leg only.
-    remaining = min(remaining, max(0.0, qty - _leg_filled_total(open_leg)))
+    remaining = _open_leg_remaining_qty(trader, symbol, position_side, qty_before, qty)
     if remaining >= min_qty:
         order_side = "BUY" if position_side == "LONG" else "SELL"
         market_qty = trader.prepare_order_qty(symbol, remaining)
@@ -600,16 +678,25 @@ def close_leg_with_ioc(
             close_leg["pre_limit"]["cancel_error"] = str(exc.payload)
 
     close_leg["pre_limit_filled_qty"] = pre_filled
-    remaining = max(0.0, current - pre_filled)
 
-    # 2) IOC loop for the remainder of this leg.
+    try:
+        close_leg["pre_limit"]["cancel_open_orders"] = trader.cancel_regular_open_orders(symbol)
+        pos_after_sweep = _position_amount(trader, symbol, position_side)
+        pre_filled = min(
+            current,
+            max(pre_filled, max(0.0, qty_before - pos_after_sweep)),
+        )
+        close_leg["pre_limit_filled_qty"] = pre_filled
+    except BinanceFuturesAPIError as exc:
+        close_leg["pre_limit"]["cancel_open_orders_error"] = str(exc.payload)
+
+    # 2) IOC loop for the remainder of this leg (position delta is source of truth).
     for attempt in range(1, max_attempts + 1):
-        if _closed_total() >= current - 1e-12:
-            close_leg["status"] = "CLOSED_LEG_QTY_FULL"
-            break
-        remaining = min(remaining, max(0.0, current - _closed_total()))
+        remaining = _close_leg_remaining_qty(
+            trader, symbol, position_side, qty_before, current
+        )
         if remaining < min_qty:
-            close_leg["status"] = "CLOSED_IOC"
+            close_leg["status"] = "CLOSED_LEG_QTY_FULL"
             break
         side_ioc, price_ioc, level_qty = trader._ioc_order_params(  # noqa: SLF001
             symbol, position_side, "close"
@@ -633,9 +720,19 @@ def close_leg_with_ioc(
                 "price": price_ioc,
             }
         )
-        executed = float(ioc_order.get("executedQty") or 0)
-        remaining = max(0.0, remaining - executed)
-        close_leg["ioc_filled_qty"] += executed
+        executed = _order_fill_qty(trader, symbol, ioc_order)
+        closed_qty = _close_leg_closed_qty(
+            qty_before,
+            _position_amount(trader, symbol, position_side),
+            current,
+        )
+        close_leg["ioc_filled_qty"] = max(
+            float(close_leg.get("ioc_filled_qty") or 0),
+            max(0.0, closed_qty - pre_filled),
+        )
+        remaining = _close_leg_remaining_qty(
+            trader, symbol, position_side, qty_before, current
+        )
         close_leg["ioc_attempts"].append(
             {
                 "attempt": attempt,
@@ -643,6 +740,7 @@ def close_leg_with_ioc(
                 "price": price_ioc,
                 "order_qty": order_qty,
                 "executed_qty": executed,
+                "position_closed_qty": closed_qty,
                 "book_level_qty": level_qty,
                 "remaining_after": remaining,
                 "order_id": ioc_order.get("orderId"),
@@ -657,7 +755,9 @@ def close_leg_with_ioc(
         close_leg["status"] = "IOC_MAX_ATTEMPTS_REACHED"
 
     # 3) MARKET fill the final remainder for this leg only.
-    remaining = min(remaining, max(0.0, current - _closed_total()))
+    remaining = _close_leg_remaining_qty(
+        trader, symbol, position_side, qty_before, current
+    )
     if remaining >= min_qty:
         order_side = "SELL" if position_side == "LONG" else "BUY"
         market_qty = trader.prepare_order_qty(symbol, remaining)
